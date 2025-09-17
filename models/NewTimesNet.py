@@ -1,5 +1,3 @@
-
-# ========== 重新实现，严格对齐 TSLib/TimesNet 接口，创新点保留 ===========
 import torch
 import torch.fft
 import torch.nn as nn
@@ -49,7 +47,7 @@ class PatchPeriodBlock(nn.Module):
     def forward(self, x):
         # x: [B, L, C]
         B, L, C = x.shape
-        x, n_patches = self.patch_embedding(x)  # [B, n_patches, C*d_model]
+        x, n_patches = self.patch_embedding(x)  # [B, n_patches, d_model]
         # FFT for period
         xf = torch.fft.rfft(x, dim=1)
         frequency_list = abs(xf).mean(0).mean(-1)
@@ -61,9 +59,8 @@ class PatchPeriodBlock(nn.Module):
         # Period Gate
         gate = torch.softmax(self.period_gate[:k], dim=0) * torch.softmax(period_weight.mean(0), dim=0)
         gate = gate / gate.sum()
-        # mean pooling over patch 维度
-        x = x.mean(dim=1)  # [B, d_model]
-        x = self.proj(x)   # [B, d_model]
+        # 保持时序维度，不做 mean pooling
+        x = self.proj(x)   # [B, n_patches, d_model]
         x = self.dropout(x)
         return x
 
@@ -119,7 +116,8 @@ class Model(nn.Module):
         for block in self.blocks:
             enc_out = block(enc_out)
             enc_out = self.norm(enc_out)
-        # [B, d_model]
+        # mean pooling over patch 维度
+        enc_out = enc_out.mean(dim=1)  # [B, d_model]
         dec_out = self.projection(enc_out).unsqueeze(1)  # [B, 1, c_out]
         # De-Normalization
         dec_out = dec_out * stdev[:, 0, :].unsqueeze(1)
