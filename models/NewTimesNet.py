@@ -26,48 +26,6 @@ class PatchEmbedding(nn.Module):
         x = x.view(B, n_patches, -1)  # [B, n_patches, C*d_model]
         return self.dropout(x), n_patches
 
-# Squeeze-and-Excitation Block
-class SEBlock(nn.Module):
-    """
-    SE块
-    [Squeeze-and-Excitation Networks](https://arxiv.org/abs/1709.01507)
-    """
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        self.fc1 = nn.Linear(channels, channels // reduction)
-        self.fc2 = nn.Linear(channels // reduction, channels)
-    def forward(self, x):
-        # x: (B, C, H, W)
-        b, c, h, w = x.size()
-        y = x.mean(dim=(2, 3))  # (B, C)
-        y = F.relu(self.fc1(y))
-        y = torch.sigmoid(self.fc2(y)).view(b, c, 1, 1)
-        return x * y
-
-# RMSNorm
-class RMSNorm(nn.Module):
-    def __init__(self, d, eps=1e-8):
-        super().__init__()
-        self.eps = eps
-        self.scale = nn.Parameter(torch.ones(d))
-    def forward(self, x):
-        # x: (..., d)
-        norm = x.norm(dim=-1, keepdim=True) * (x.shape[-1] ** -0.5)
-        return self.scale * x / (norm + self.eps)
-
-
-# FFT only once，返回周期和幅值
-def FFT_for_Period(x, k=2):
-    xf = torch.fft.rfft(x, dim=1)
-    frequency_list = abs(xf).mean(0).mean(-1)
-    frequency_list[0] = 0
-    _, top_list = torch.topk(frequency_list, k)
-    top_list = top_list.detach().cpu().numpy()
-    period = x.shape[1] // top_list
-    return period, abs(xf).mean(-1)[:, top_list]
-
-
-
 # Patch-Period Block: patch embedding + FFT周期建模 + flatten head
 class PatchPeriodBlock(nn.Module):
     def __init__(self, configs):
@@ -80,7 +38,7 @@ class PatchPeriodBlock(nn.Module):
         self.flatten = nn.Flatten(start_dim=1)
         self.head = nn.Linear(self.d_model * configs.n_patches, configs.pred_len)
         self.dropout = nn.Dropout(configs.dropout)
-    def forward(self, x):
+    def forward(self, x, period_list, period_weight):
         # x: [B, L, C]
         B, L, C = x.shape
         # patch embedding
@@ -102,42 +60,45 @@ class PatchPeriodBlock(nn.Module):
         x = self.dropout(x)
         return x
 
+# FFT only once，返回周期和幅值
+def FFT_for_Period(x, k=2):
+    xf = torch.fft.rfft(x, dim=1)
+    frequency_list = abs(xf).mean(0).mean(-1)
+    frequency_list[0] = 0
+    _, top_list = torch.topk(frequency_list, k)
+    top_list = top_list.detach().cpu().numpy()
+    period = x.shape[1] // top_list
+    return period, abs(xf).mean(-1)[:, top_list]
 
 
 class Model(nn.Module):
     """
-    Patch-Period NewTimesNet: 融合patch embedding和周期建模，提升长期预测性能。
+    Patch-Period NewTimesNet: 融合TimeXer patch embedding和周期建模，提升长期预测性能。
     
+    相较于TimesNet的创新点：
     1. Patch Embedding：借鉴TimeXer，将长序列分块（patch），每个patch通过线性层映射到高维空间，提升对长序列的建模能力和效率。
     2. Patch-Period Block：将patch embedding与周期建模（FFT+周期门控）结合，充分利用周期性和局部/全局特征。
     3. Flatten Head结构：借鉴TimeXer，patch特征直接flatten后用线性层输出预测结果，简化输出头部，提升效率。
     4. 结构极简：主干仅包含patch embedding、周期建模和flatten head，参数量和推理速度优于原始TimesNet。
     5. 更强的全局建模能力：patch embedding天然具备全局感受野，周期建模进一步增强对周期性和全局依赖的捕捉。
-    6. 代码实现更易于扩展：可灵活插入注意力、全局token等模块。
+    6. 代码实现更易于扩展：可灵活插入注意力、全局token等模块，便于后续创新。
     """
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
         self.task_name = configs.task_name
         self.seq_len = configs.seq_len
+        self.label_len = configs.label_len
         self.pred_len = configs.pred_len
-        self.patch_len = configs.patch_len
-        self.n_patches = self.seq_len // self.patch_len
-        configs.n_patches = self.n_patches
-        self.d_model = configs.d_model
-        self.enc_in = configs.enc_in
-        self.patch_period_block = PatchPeriodBlock(configs)
-
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # x_enc: [B, L, C]
-        return self.patch_period_block(x_enc)
-
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name in ['long_term_forecast', 'short_term_forecast']:
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out
-        return None
-
+        self.model = nn.ModuleList([PatchPeriodBlock(configs) for _ in range(configs.e_layers)])
+        self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq, configs.dropout)
+        self.layer = configs.e_layers
+        self.layer_norm = nn.LayerNorm(configs.d_model)
+        self.predict_linear = nn.Linear(self.seq_len, self.pred_len + self.seq_len)
+        self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
+        self.norm = nn.LayerNorm(configs.d_model)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(configs.dropout)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # Normalization
@@ -152,18 +113,15 @@ class Model(nn.Module):
 
         # FFT 只做一次
         period_list, period_weight = FFT_for_Period(enc_out, self.model[0].k)
-        # TimesNet
         for i in range(self.layer):
             enc_out = self.model[i](enc_out, period_list, period_weight)
             enc_out = self.norm(enc_out)
-        # project back
         dec_out = self.projection(enc_out)
 
         # De-Normalization
         dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
         dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
         return dec_out
-
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
         means = torch.sum(x_enc, dim=1) / torch.sum(mask == 1, dim=1)
@@ -184,7 +142,6 @@ class Model(nn.Module):
         dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
         return dec_out
 
-
     def anomaly_detection(self, x_enc):
         means = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc - means
@@ -200,7 +157,6 @@ class Model(nn.Module):
         dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
         dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
         return dec_out
-
 
     def classification(self, x_enc, x_mark_enc):
         enc_out = self.enc_embedding(x_enc, None)
