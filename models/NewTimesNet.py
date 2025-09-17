@@ -1,9 +1,21 @@
 import torch
-import torch.fft
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.fft
 from layers.Embed import DataEmbedding
 
 
+def FFT_for_Period(x, k=2):
+    # x: [B, n_patches, d_model]
+    xf = torch.fft.rfft(x, dim=1)
+    frequency_list = abs(xf).mean(0).mean(-1)
+    frequency_list[0] = 0
+    _, top_list = torch.topk(frequency_list, k)
+    return top_list, abs(xf).mean(-1)[:, top_list]
+
+
+
+# Patch Embedding
 class PatchEmbedding(nn.Module):
     """
     Patch Embedding: [B, L, C] -> [B, n_patches, d_model]
@@ -34,8 +46,9 @@ class PatchEmbedding(nn.Module):
         x = self.value_embedding(x)  # [B*n_patches*C, d_model]
         x = x.view(B, n_patches, C, self.d_model)
         x = x.mean(dim=2)  # [B, n_patches, d_model]  # 对变量维做平均
-        return self.dropout(x), n_patches
+        return self.dropout(x)
 
+# Patch+Period Block
 class PatchPeriodBlock(nn.Module):
     """
     Patch+Period Block: patch embedding + FFT周期建模 + flatten head
@@ -48,14 +61,14 @@ class PatchPeriodBlock(nn.Module):
         self.n_vars = configs.enc_in
         self.dropout = nn.Dropout(configs.dropout)
         self.patch_embedding = PatchEmbedding(self.n_vars, self.d_model, self.patch_len, dropout=configs.dropout)
-        # mean pooling + projection，输入为 d_model
         self.proj = nn.Linear(self.d_model, self.d_model)
         self.period_gate = nn.Parameter(torch.ones(self.k))
 
     def forward(self, x):
-        # x: [B, L, C]
-        B, L, C = x.shape
-        x, n_patches = self.patch_embedding(x)  # [B, n_patches, d_model]
+        # x: [B, L, C] or [B, n_patches, d_model]
+        if x.dim() == 3 and x.shape[-1] != self.d_model:
+            # 输入为原始序列 [B, L, C]
+            x = self.patch_embedding(x)  # [B, n_patches, d_model]
         # FFT for period
         xf = torch.fft.rfft(x, dim=1)
         frequency_list = abs(xf).mean(0).mean(-1)
@@ -67,24 +80,31 @@ class PatchPeriodBlock(nn.Module):
         # Period Gate
         gate = torch.softmax(self.period_gate[:k], dim=0) * torch.softmax(period_weight.mean(0), dim=0)
         gate = gate / gate.sum()
-        # 保持时序维度，不做 mean pooling
+        # 门控聚合（可扩展）
         x = self.proj(x)   # [B, n_patches, d_model]
         x = self.dropout(x)
         return x
 
-def FFT_for_Period(x, k=2):
-    xf = torch.fft.rfft(x, dim=1)
-    frequency_list = abs(xf).mean(0).mean(-1)
-    frequency_list[0] = 0
-    _, top_list = torch.topk(frequency_list, k)
-    period = x.shape[1] // top_list
-    return period, abs(xf).mean(-1)[:, top_list]
+# Flatten Head
+class FlattenHead(nn.Module):
+    def __init__(self, d_model, c_out, dropout=0.0):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(d_model, c_out)
+
+    def forward(self, x):
+        # x: [B, n_patches, d_model]
+        x = x.mean(dim=1)  # mean pooling over patch 维度
+        x = self.dropout(x)
+        x = self.proj(x)  # [B, c_out]
+        return x.unsqueeze(1)  # [B, 1, c_out]
+
 
 class Model(nn.Module):
     """
     Patch-Period NewTimesNet: Patch Embedding + FFT周期建模 + flatten head
     
-    创新点：
+    要求创新点：
     1. Patch Embedding：借鉴TimeXer，将长序列分块（patch），每个patch通过线性层映射到高维空间，提升对长序列的建模能力和效率。
     2. Patch-Period Block：将patch embedding与周期建模（FFT+周期门控）结合，充分利用周期性和局部/全局特征。
     3. Flatten Head结构：借鉴TimeXer，patch特征mean pooling后用线性层输出预测结果，简化输出头部，提升效率。
@@ -94,6 +114,7 @@ class Model(nn.Module):
     
     接口、参数、输入输出 shape 与 TimesNet/TSLib 完全一致
     """
+
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
@@ -105,28 +126,23 @@ class Model(nn.Module):
         self.c_out = configs.c_out
         self.d_model = configs.d_model
         self.e_layers = configs.e_layers
-        self.enc_embedding = DataEmbedding(self.enc_in, self.d_model, configs.embed, configs.freq, configs.dropout)
+        self.patch_len = configs.patch_len
         self.blocks = nn.ModuleList([PatchPeriodBlock(configs) for _ in range(self.e_layers)])
         self.norm = nn.LayerNorm(self.d_model)
-        self.projection = nn.Linear(self.d_model, self.c_out, bias=True)
-        self.dropout = nn.Dropout(configs.dropout)
-        self.act = nn.GELU()
+        self.head = FlattenHead(self.d_model, self.c_out, dropout=configs.dropout)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # Normalization
+        # Normalization from Non-stationary Transformer
         means = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc - means
         stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
         x_enc = x_enc / stdev
-        # embedding
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B, L, d_model]
         # Patch-Period Block
+        out = x_enc
         for block in self.blocks:
-            enc_out = block(enc_out)
-            enc_out = self.norm(enc_out)
-        # mean pooling over patch 维度
-        enc_out = enc_out.mean(dim=1)  # [B, d_model]
-        dec_out = self.projection(enc_out).unsqueeze(1)  # [B, 1, c_out]
+            out = block(out)
+            out = self.norm(out)
+        dec_out = self.head(out)  # [B, 1, c_out]
         # De-Normalization
         dec_out = dec_out * stdev[:, 0, :].unsqueeze(1)
         dec_out = dec_out + means[:, 0, :].unsqueeze(1)
@@ -142,11 +158,11 @@ class Model(nn.Module):
         stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=1) / torch.sum(mask == 1, dim=1) + 1e-5)
         stdev = stdev.unsqueeze(1).detach()
         x_enc = x_enc / stdev
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        out = x_enc
         for block in self.blocks:
-            enc_out = block(enc_out)
-            enc_out = self.norm(enc_out)
-        dec_out = self.projection(enc_out).unsqueeze(1)
+            out = block(out)
+            out = self.norm(out)
+        dec_out = self.head(out)
         dec_out = dec_out * stdev[:, 0, :].unsqueeze(1)
         dec_out = dec_out + means[:, 0, :].unsqueeze(1)
         dec_out = dec_out.repeat(1, self.pred_len, 1)
@@ -157,25 +173,23 @@ class Model(nn.Module):
         x_enc = x_enc - means
         stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
         x_enc = x_enc / stdev
-        enc_out = self.enc_embedding(x_enc, None)
+        out = x_enc
         for block in self.blocks:
-            enc_out = block(enc_out)
-            enc_out = self.norm(enc_out)
-        dec_out = self.projection(enc_out).unsqueeze(1)
+            out = block(out)
+            out = self.norm(out)
+        dec_out = self.head(out)
         dec_out = dec_out * stdev[:, 0, :].unsqueeze(1)
         dec_out = dec_out + means[:, 0, :].unsqueeze(1)
         dec_out = dec_out.repeat(1, self.pred_len, 1)
         return dec_out
 
     def classification(self, x_enc, x_mark_enc):
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        out = x_enc
         for block in self.blocks:
-            enc_out = block(enc_out)
-            enc_out = self.norm(enc_out)
-        output = self.act(enc_out)
-        output = self.dropout(output)
-        output = output.reshape(output.shape[0], -1)
-        output = self.projection(output)
+            out = block(out)
+            out = self.norm(out)
+        output = out.mean(dim=1)
+        output = self.head.proj(output)
         return output
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
