@@ -18,7 +18,15 @@ class PatchEmbedding(nn.Module):
     def forward(self, x):
         # x: [B, L, C]
         B, L, C = x.shape
-        n_patches = L // self.patch_len
+        # 自动补零，保证至少有一个patch
+        if L < self.patch_len:
+            pad_len = self.patch_len - L
+            x = torch.cat([x, torch.zeros(B, pad_len, C, device=x.device, dtype=x.dtype)], dim=1)
+            L = self.patch_len
+        n_patches = (L + self.patch_len - 1) // self.patch_len  # 向上取整
+        pad_total = n_patches * self.patch_len - L
+        if pad_total > 0:
+            x = torch.cat([x, torch.zeros(B, pad_total, C, device=x.device, dtype=x.dtype)], dim=1)
         x = x[:, :n_patches * self.patch_len, :]  # [B, n_patches*patch_len, C]
         x = x.reshape(B, n_patches, self.patch_len, C)  # [B, n_patches, patch_len, C]
         x = x.permute(0, 1, 3, 2)  # [B, n_patches, C, patch_len]
