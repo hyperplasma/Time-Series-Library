@@ -21,12 +21,13 @@ class PatchEmbedding(nn.Module):
         # x: [B, L, C]
         B, L, C = x.shape
         n_patches = L // self.patch_len
-        x = x[:, :n_patches * self.patch_len, :]  # 截断多余部分
-        x = x.permute(0, 2, 1)  # [B, C, L]
-        x = x.reshape(B * C, n_patches, self.patch_len)  # [B*C, n_patches, patch_len]
-        x = self.value_embedding(x)  # [B*C, n_patches, d_model]
-        x = x.view(B, C, n_patches, self.d_model).permute(0, 2, 1, 3).contiguous()  # [B, n_patches, C, d_model]
-        x = x.view(B, n_patches, C * self.d_model)  # [B, n_patches, C*d_model]
+        x = x[:, :n_patches * self.patch_len, :]  # [B, n_patches*patch_len, C]
+        x = x.reshape(B, n_patches, self.patch_len, C)  # [B, n_patches, patch_len, C]
+        x = x.permute(0, 1, 3, 2)  # [B, n_patches, C, patch_len]
+        x = x.reshape(B * n_patches * C, self.patch_len)  # [B*n_patches*C, patch_len]
+        x = self.value_embedding(x)  # [B*n_patches*C, d_model]
+        x = x.view(B, n_patches, C, self.d_model)
+        x = x.mean(dim=2)  # [B, n_patches, d_model]  # 对变量维做平均
         return self.dropout(x), n_patches
 
 class PatchPeriodBlock(nn.Module):
@@ -41,8 +42,8 @@ class PatchPeriodBlock(nn.Module):
         self.n_vars = configs.enc_in
         self.dropout = nn.Dropout(configs.dropout)
         self.patch_embedding = PatchEmbedding(self.n_vars, self.d_model, self.patch_len, dropout=configs.dropout)
-        # 不再用固定 head 层，改为 mean pooling + projection
-        self.proj = nn.Linear(self.d_model * self.n_vars, self.d_model)
+        # mean pooling + projection，输入为 d_model
+        self.proj = nn.Linear(self.d_model, self.d_model)
         self.period_gate = nn.Parameter(torch.ones(self.k))
 
     def forward(self, x):
@@ -61,7 +62,7 @@ class PatchPeriodBlock(nn.Module):
         gate = torch.softmax(self.period_gate[:k], dim=0) * torch.softmax(period_weight.mean(0), dim=0)
         gate = gate / gate.sum()
         # mean pooling over patch 维度
-        x = x.mean(dim=1)  # [B, C*d_model]
+        x = x.mean(dim=1)  # [B, d_model]
         x = self.proj(x)   # [B, d_model]
         x = self.dropout(x)
         return x
@@ -77,6 +78,15 @@ def FFT_for_Period(x, k=2):
 class Model(nn.Module):
     """
     Patch-Period NewTimesNet: Patch Embedding + FFT周期建模 + flatten head
+    
+    创新点：
+    1. Patch Embedding：借鉴TimeXer，将长序列分块（patch），每个patch通过线性层映射到高维空间，提升对长序列的建模能力和效率。
+    2. Patch-Period Block：将patch embedding与周期建模（FFT+周期门控）结合，充分利用周期性和局部/全局特征。
+    3. Flatten Head结构：借鉴TimeXer，patch特征mean pooling后用线性层输出预测结果，简化输出头部，提升效率。
+    4. 结构极简：主干仅包含patch embedding、周期建模和flatten head，参数量和推理速度优于原始TimesNet。
+    5. 更强的全局建模能力：patch embedding天然具备全局感受野，周期建模进一步增强对周期性和全局依赖的捕捉。
+    6. 代码实现更易于扩展：可灵活插入注意力、全局token等模块，便于后续创新。
+    
     接口、参数、输入输出 shape 与 TimesNet/TSLib 完全一致
     """
     def __init__(self, configs):
