@@ -17,9 +17,10 @@ class PatchEmbedding(nn.Module):
     def forward(self, x):
         # x: [B, L, C]
         B, L, C = x.shape
+        n_patches = L // self.patch_len
+        x = x[:, :n_patches * self.patch_len, :]
         x = x.permute(0, 2, 1)  # [B, C, L]
-        x = x.unfold(dimension=-1, size=self.patch_len, step=self.patch_len)  # [B, C, n_patches, patch_len]
-        n_patches = x.shape[2]
+        x = x.reshape(B, C, n_patches, self.patch_len)  # [B, C, n_patches, patch_len]
         x = x.contiguous().view(B * C, n_patches, self.patch_len)
         x = self.value_embedding(x)
         x = x.view(B, C, n_patches, -1).permute(0, 2, 1, 3).contiguous()  # [B, n_patches, C, d_model]
@@ -35,13 +36,11 @@ class PatchPeriodBlock(nn.Module):
         self.k = configs.top_k
         self.n_vars = configs.enc_in
         self.period_gate = nn.Parameter(torch.ones(self.k))
-        self.flatten = nn.Flatten(start_dim=1)
-        self.head = nn.Linear(self.d_model * configs.n_patches, configs.pred_len)
         self.dropout = nn.Dropout(configs.dropout)
     def forward(self, x, period_list, period_weight):
         # x: [B, L, C]
         B, L, C = x.shape
-        # patch embedding
+        n_patches = L // self.patch_len
         x, n_patches = PatchEmbedding(C, self.d_model, self.patch_len)(x)
         # FFT for period
         xf = torch.fft.rfft(x, dim=1)
@@ -55,8 +54,9 @@ class PatchPeriodBlock(nn.Module):
         gate = torch.softmax(self.period_gate, dim=0) * torch.softmax(period_weight.mean(0), dim=0)
         gate = gate / gate.sum()
         # flatten + head
-        x = self.flatten(x)
-        x = self.head(x)
+        x = x.reshape(B, -1)
+        head = nn.Linear(self.d_model * n_patches * C, self.d_model)
+        x = head(x)
         x = self.dropout(x)
         return x
 
