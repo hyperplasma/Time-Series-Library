@@ -54,10 +54,12 @@ class PatchPeriodBlock(nn.Module):
         xf = torch.fft.rfft(x, dim=1)
         frequency_list = abs(xf).mean(0).mean(-1)
         frequency_list[0] = 0
-        _, top_list = torch.topk(frequency_list, self.k)
+        freq_len = frequency_list.shape[0]
+        k = min(self.k, freq_len)
+        _, top_list = torch.topk(frequency_list, k)
         period_weight = abs(xf).mean(-1)[:, top_list]
         # Period Gate
-        gate = torch.softmax(self.period_gate, dim=0) * torch.softmax(period_weight.mean(0), dim=0)
+        gate = torch.softmax(self.period_gate[:k], dim=0) * torch.softmax(period_weight.mean(0), dim=0)
         gate = gate / gate.sum()
         # flatten + head
         x = x.reshape(B, -1)
