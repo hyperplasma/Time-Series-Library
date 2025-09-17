@@ -41,9 +41,8 @@ class PatchPeriodBlock(nn.Module):
         self.n_vars = configs.enc_in
         self.dropout = nn.Dropout(configs.dropout)
         self.patch_embedding = PatchEmbedding(self.n_vars, self.d_model, self.patch_len, dropout=configs.dropout)
-        # head 层参数化，最大输入长度为 seq_len//patch_len
-        max_patches = configs.seq_len // self.patch_len
-        self.head = nn.Linear(self.d_model * self.n_vars * max_patches, self.d_model)
+        # 不再用固定 head 层，改为 mean pooling + projection
+        self.proj = nn.Linear(self.d_model * self.n_vars, self.d_model)
         self.period_gate = nn.Parameter(torch.ones(self.k))
 
     def forward(self, x):
@@ -61,9 +60,9 @@ class PatchPeriodBlock(nn.Module):
         # Period Gate
         gate = torch.softmax(self.period_gate[:k], dim=0) * torch.softmax(period_weight.mean(0), dim=0)
         gate = gate / gate.sum()
-        # flatten + head
-        x = x.reshape(B, -1)
-        x = self.head(x)
+        # mean pooling over patch 维度
+        x = x.mean(dim=1)  # [B, C*d_model]
+        x = self.proj(x)   # [B, d_model]
         x = self.dropout(x)
         return x
 
