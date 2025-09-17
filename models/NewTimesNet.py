@@ -37,11 +37,12 @@ class PatchPeriodBlock(nn.Module):
         self.n_vars = configs.enc_in
         self.period_gate = nn.Parameter(torch.ones(self.k))
         self.dropout = nn.Dropout(configs.dropout)
+        self.patch_embedding = PatchEmbedding(self.n_vars, self.d_model, self.patch_len, dropout=configs.dropout)
     def forward(self, x, period_list, period_weight):
         # x: [B, L, C]
         B, L, C = x.shape
         n_patches = L // self.patch_len
-        x, n_patches = PatchEmbedding(C, self.d_model, self.patch_len)(x)
+        x, n_patches = self.patch_embedding(x)
         # FFT for period
         xf = torch.fft.rfft(x, dim=1)
         frequency_list = abs(xf).mean(0).mean(-1)
@@ -55,8 +56,10 @@ class PatchPeriodBlock(nn.Module):
         gate = gate / gate.sum()
         # flatten + head
         x = x.reshape(B, -1)
-        head = nn.Linear(self.d_model * n_patches * C, self.d_model)
-        x = head(x)
+        # head 层也要只初始化一次，放到 __init__
+        if not hasattr(self, 'head'):
+            self.head = nn.Linear(self.d_model * n_patches * C, self.d_model).to(x.device)
+        x = self.head(x)
         x = self.dropout(x)
         return x
 
