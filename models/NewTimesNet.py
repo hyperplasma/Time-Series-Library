@@ -49,55 +49,66 @@ class PatchEmbedding(nn.Module):
         return self.dropout(x)
 
 # Patch+Period Block
+
 class PatchPeriodBlock(nn.Module):
     """
-    Patch+Period Block: patch embedding + FFT周期建模 + flatten head
+    多尺度 Patch+Period Block: 多个 patch embedding + FFT 周期建模 + 拼接输出
     """
     def __init__(self, configs):
         super().__init__()
-        self.patch_len = configs.patch_len
         self.d_model = configs.d_model
         self.k = configs.top_k
         self.n_vars = configs.enc_in
         self.dropout = nn.Dropout(configs.dropout)
-        self.patch_embedding = PatchEmbedding(self.n_vars, self.d_model, self.patch_len, dropout=configs.dropout)
-        self.proj = nn.Linear(self.d_model, self.d_model)
-        self.period_gate = nn.Parameter(torch.ones(self.k))
+        # 支持多尺度 patch_lens
+        self.patch_lens = getattr(configs, 'patch_lens', [configs.patch_len])
+        self.patch_embeddings = nn.ModuleList([
+            PatchEmbedding(self.n_vars, self.d_model, pl, dropout=configs.dropout)
+            for pl in self.patch_lens
+        ])
+        self.projs = nn.ModuleList([
+            nn.Linear(self.d_model, self.d_model) for _ in self.patch_lens
+        ])
+        self.period_gates = nn.ParameterList([
+            nn.Parameter(torch.ones(self.k)) for _ in self.patch_lens
+        ])
 
     def forward(self, x):
-        # x: [B, L, C] or [B, n_patches, d_model]
-        if x.dim() == 3 and x.shape[-1] != self.d_model:
-            # 输入为原始序列 [B, L, C]
-            x = self.patch_embedding(x)  # [B, n_patches, d_model]
-        # FFT for period
-        xf = torch.fft.rfft(x, dim=1)
-        frequency_list = abs(xf).mean(0).mean(-1)
-        frequency_list[0] = 0
-        freq_len = frequency_list.shape[0]
-        k = min(self.k, freq_len)
-        _, top_list = torch.topk(frequency_list, k)
-        period_weight = abs(xf).mean(-1)[:, top_list]
-        # Period Gate
-        gate = torch.softmax(self.period_gate[:k], dim=0) * torch.softmax(period_weight.mean(0), dim=0)
-        gate = gate / gate.sum()
-        # 门控聚合（可扩展）
-        x = self.proj(x)   # [B, n_patches, d_model]
-        x = self.dropout(x)
-        return x
+        # x: [B, L, C]
+        outs = []
+        for pe, proj, period_gate in zip(self.patch_embeddings, self.projs, self.period_gates):
+            px = pe(x)  # [B, n_patches, d_model]
+            xf = torch.fft.rfft(px, dim=1)
+            frequency_list = abs(xf).mean(0).mean(-1)
+            frequency_list[0] = 0
+            freq_len = frequency_list.shape[0]
+            k = min(self.k, freq_len)
+            _, top_list = torch.topk(frequency_list, k)
+            period_weight = abs(xf).mean(-1)[:, top_list]
+            # Period Gate
+            gate = torch.softmax(period_gate[:k], dim=0) * torch.softmax(period_weight.mean(0), dim=0)
+            gate = gate / gate.sum()
+            # 门控聚合（可扩展）
+            px = proj(px)
+            px = self.dropout(px)
+            outs.append(px)
+        # 多尺度拼接
+        x_cat = torch.cat(outs, dim=-1)  # [B, n_patches, d_model * n_scale]
+        return x_cat
 
 # Flatten Head
 class FlattenHead(nn.Module):
-    def __init__(self, d_model, c_out, dropout=0.0):
+    def __init__(self, d_model, c_out, n_scale=1, dropout=0.0):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(d_model, c_out)
+        self.proj = nn.Linear(d_model * n_scale, c_out)
 
     def forward(self, x):
-        # x: [B, n_patches, d_model]
-        x = x.mean(dim=1)  # mean pooling over patch 维度
+        # x: [B, n_patches, d_model * n_scale]
+        x = x.mean(dim=1)
         x = self.dropout(x)
-        x = self.proj(x)  # [B, c_out]
-        return x.unsqueeze(1)  # [B, 1, c_out]
+        x = self.proj(x)
+        return x.unsqueeze(1)
 
 
 class Model(nn.Module):
@@ -111,6 +122,7 @@ class Model(nn.Module):
     4. 结构极简：主干仅包含patch embedding、周期建模和flatten head，参数量和推理速度优于原始TimesNet。
     5. 更强的全局建模能力：patch embedding天然具备全局感受野，周期建模进一步增强对周期性和全局依赖的捕捉。
     6. 代码实现更易于扩展：可灵活插入注意力、全局token等模块，便于后续创新。
+    7. 多尺度Patch/FFT：支持多尺度patch划分和多尺度FFT周期建模，不同patch长度的特征并行提取与拼接，进一步提升对多尺度周期性和复杂时序结构的建模能力。
     
     接口、参数、输入输出 shape 与 TimesNet/TSLib 完全一致
     """
@@ -126,10 +138,11 @@ class Model(nn.Module):
         self.c_out = configs.c_out
         self.d_model = configs.d_model
         self.e_layers = configs.e_layers
-        self.patch_len = configs.patch_len
+        self.patch_lens = getattr(configs, 'patch_lens', [configs.patch_len])
+        self.n_scale = len(self.patch_lens)
         self.blocks = nn.ModuleList([PatchPeriodBlock(configs) for _ in range(self.e_layers)])
-        self.norm = nn.LayerNorm(self.d_model)
-        self.head = FlattenHead(self.d_model, self.c_out, dropout=configs.dropout)
+        self.norm = nn.LayerNorm(self.d_model * self.n_scale)
+        self.head = FlattenHead(self.d_model, self.c_out, n_scale=self.n_scale, dropout=configs.dropout)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # Normalization from Non-stationary Transformer
