@@ -319,8 +319,13 @@ class Model(nn.Module):
         enc_res, mean_res, stdev_res = self._process_single_component(x_res)
 
         # 3. 动态融合权重：k=2时屏蔽趋势权重（alpha=0）
+        # 修复：确保所有张量都是1维的，以便正确拼接
         if self.vmd_k == 2:
-            weights = F.softmax(torch.cat([torch.tensor(0.0, device=x_enc.device), self.beta, self.gamma]), dim=0)
+            weights = F.softmax(torch.cat([
+                torch.tensor([0.0], device=x_enc.device),  # 改为1维张量
+                self.beta, 
+                self.gamma
+            ]), dim=0)
         else:
             weights = F.softmax(torch.cat([self.alpha, self.beta, self.gamma]), dim=0)
         enc_total = weights[0] * enc_trend + weights[1] * enc_period + weights[2] * enc_res
@@ -379,7 +384,11 @@ class Model(nn.Module):
         enc_res = enc_res.reshape(-1, nvars, enc_res.shape[-2], enc_res.shape[-1]).permute(0,1,3,2)
 
         if self.vmd_k == 2:
-            weights = F.softmax(torch.cat([torch.tensor(0.0, device=x_enc.device), self.beta, self.gamma]), dim=0)
+            weights = F.softmax(torch.cat([
+                torch.tensor([0.0], device=x_enc.device),  # 改为1维张量
+                self.beta, 
+                self.gamma
+            ]), dim=0)
         else:
             weights = F.softmax(torch.cat([self.alpha, self.beta, self.gamma]), dim=0)
         enc_total = weights[0]*enc_trend + weights[1]*enc_period + weights[2]*enc_res
@@ -400,7 +409,11 @@ class Model(nn.Module):
         enc_res, mean_res, stdev_res = self._process_single_component(x_res)
 
         if self.vmd_k == 2:
-            weights = F.softmax(torch.cat([torch.tensor(0.0, device=x_enc.device), self.beta, self.gamma]), dim=0)
+            weights = F.softmax(torch.cat([
+                torch.tensor([0.0], device=x_enc.device),  # 改为1维张量
+                self.beta, 
+                self.gamma
+            ]), dim=0)
         else:
             weights = F.softmax(torch.cat([self.alpha, self.beta, self.gamma]), dim=0)
         enc_total = weights[0]*enc_trend + weights[1]*enc_period + weights[2]*enc_res
@@ -420,7 +433,11 @@ class Model(nn.Module):
         enc_res, _, _ = self._process_single_component(x_res)
 
         if self.vmd_k == 2:
-            weights = F.softmax(torch.cat([torch.tensor(0.0, device=x_enc.device), self.beta, self.gamma]), dim=0)
+            weights = F.softmax(torch.cat([
+                torch.tensor([0.0], device=x_enc.device),  # 改为1维张量
+                self.beta, 
+                self.gamma
+            ]), dim=0)
         else:
             weights = F.softmax(torch.cat([self.alpha, self.beta, self.gamma]), dim=0)
         enc_total = weights[0]*enc_trend + weights[1]*enc_period + weights[2]*enc_res
