@@ -22,7 +22,7 @@ python -u run.py \
   --c_out 21 \
   --d_model 512 \
   --n_heads 4 \
-  --train_epochs 10 \
+  --train_epochs 5 \
   --patch_len 16 \
   --des 'Exp' \
   --itr 1
@@ -47,7 +47,7 @@ python -u run.py \
   --c_out 21 \
   --d_model 512 \
   --n_heads 16 \
-  --train_epochs 10 \
+  --train_epochs 5 \
   --patch_len 16 \
   --des 'Exp' \
   --itr 1
@@ -73,7 +73,7 @@ python -u run.py \
   --d_model 512 \
   --n_heads 4 \
   --batch_size 128 \
-  --train_epochs 10 \
+  --train_epochs 5 \
   --patch_len 16 \
   --des 'Exp' \
   --itr 1
@@ -99,7 +99,7 @@ python -u run.py \
   --d_model 512 \
   --n_heads 4 \
   --batch_size 128 \
-  --train_epochs 10 \
+  --train_epochs 5 \
   --patch_len 16 \
   --des 'Exp' \
   --itr 1
