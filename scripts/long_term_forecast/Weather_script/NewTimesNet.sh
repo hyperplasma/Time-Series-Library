@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=0
 
 model_name=NewTimesNet
 
@@ -20,9 +20,11 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
+  --d_model 512 \
+  --n_heads 4 \
+  --train_epochs 3 \
+  --patch_len 16 \
+  --stride 8 \
   --des 'Exp' \
   --itr 1
 
@@ -44,13 +46,13 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
+  --d_model 512 \
+  --n_heads 16 \
+  --train_epochs 3 \
+  --patch_len 16 \
+  --stride 8 \
   --des 'Exp' \
-  --itr 1 \
-  --train_epochs 1
-
+  --itr 1
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -70,9 +72,12 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
+  --d_model 512 \
+  --n_heads 4 \
+  --batch_size 128 \
+  --train_epochs 3 \
+  --patch_len 16 \
+  --stride 8 \
   --des 'Exp' \
   --itr 1
 
@@ -94,9 +99,11 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
+  --d_model 512 \
+  --n_heads 4 \
+  --batch_size 128 \
+  --train_epochs 3 \
+  --patch_len 16 \
+  --stride 8 \
   --des 'Exp' \
-  --itr 1 \
-  --train_epochs 1
+  --itr 1
