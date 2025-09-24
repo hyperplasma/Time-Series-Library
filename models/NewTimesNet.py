@@ -8,11 +8,12 @@ from layers.SelfAttention_Family import FullAttention, AttentionLayer
 from layers.Embed import PatchEmbedding
 
 
-# -------------------------- 模块1：VMD时序分解（可微分实现） --------------------------
+# -------------------------- 模块1：VMD时序分解 --------------------------
 class VMD(nn.Module):
     """
     变分模态分解（Variational Mode Decomposition），用于将时序序列分解为趋势、周期、残差成分
     参考原始算法：https://doi.org/10.1109/TSP.2013.2288675
+    保持掩码后张量维度为[B, L, D]，避免展平导致的IndexError
     """
     def __init__(self, k: int = 3, alpha: float = 2000.0, tau: float = 0.001, max_iter: int = 100):
         super().__init__()
@@ -31,65 +32,69 @@ class VMD(nn.Module):
         device = x.device
 
         # 初始化变量（对每个样本+特征维度独立分解）
-        u = torch.zeros(B, self.k, L, D, device=device)  # 各模态输出
-        omega = torch.zeros(B, self.k, D, device=device)  # 各模态中心频率
-        lambda_ = torch.zeros(B, L, D, device=device)     # 对偶变量
+        u = torch.zeros(B, self.k, L, D, device=device)  # 各模态输出 [B, k, L, D]
+        omega = torch.zeros(B, self.k, D, device=device)  # 各模态中心频率 [B, k, D]
+        lambda_ = torch.zeros(B, L, D, device=device)     # 对偶变量 [B, L, D]
 
-        # 傅里叶变换相关初始化（快速傅里叶变换，中心化处理）
+        # 傅里叶变换相关初始化（保持维度为[B, L, D]）
         t = torch.arange(1, L+1, device=device).unsqueeze(0).unsqueeze(-1)  # [1, L, 1]
         f = torch.fft.fftfreq(L, d=1.0, device=device).unsqueeze(0).unsqueeze(-1)  # [1, L, 1]
-        f_shifted = torch.fft.fftshift(f)  # 频率轴中心化
-        f_shifted = f_shifted.expand(B, -1, D)  # [B, L, D]
+        f_shifted = torch.fft.fftshift(f)  # 频率轴中心化 [1, L, 1]
+        f_shifted = f_shifted.expand(B, -1, D)  # 扩展到[B, L, D]（关键：保持三维）
 
         # VMD迭代过程（可微分）
-        x_hat = torch.fft.fftshift(torch.fft.fft(x, dim=1), dim=1)  # 输入的傅里叶变换（中心化）
+        x_hat = torch.fft.fftshift(torch.fft.fft(x, dim=1), dim=1)  # 输入的傅里叶变换 [B, L, D]
         for _ in range(self.max_iter):
-            # 1. 更新各模态u（傅里叶域）
+            # 1. 更新各模态u（傅里叶域，保持维度）
             for k_idx in range(self.k):
-                # 计算当前模态的分子：(x_hat - 平均其他模态 + lambda_/2)
+                # 计算当前模态的分子：(x_hat - 其他模态和 + lambda_/2)
                 sum_other = torch.sum(u[:, [k_ for k_ in range(self.k) if k_ != k_idx]], dim=1)  # [B, L, D]
-                sum_other_hat = torch.fft.fftshift(torch.fft.fft(sum_other, dim=1), dim=1)  # 其他模态的傅里叶变换
+                sum_other_hat = torch.fft.fftshift(torch.fft.fft(sum_other, dim=1), dim=1)  # [B, L, D]
                 numerator = x_hat - sum_other_hat + lambda_ / 2  # [B, L, D]
 
                 # 计算当前模态的分母：1 + 2*alpha*(f - omega[:,k_idx])^2
-                omega_k = omega[:, k_idx].unsqueeze(1)  # [B, 1, D]
+                omega_k = omega[:, k_idx].unsqueeze(1)  # [B, 1, D]（扩展时序维度，匹配[B, L, D]）
                 denominator = 1 + 2 * self.alpha * (f_shifted - omega_k) ** 2  # [B, L, D]
 
-                # 更新当前模态的傅里叶域表示
+                # 更新当前模态的傅里叶域表示 + 逆变换回时域
                 u_hat_k = numerator / denominator  # [B, L, D]
-                # 逆傅里叶变换回时域
                 u[:, k_idx] = torch.fft.ifft(torch.fft.ifftshift(u_hat_k, dim=1), dim=1).real  # [B, L, D]
 
-            # 2. 更新中心频率omega（按能量加权）
+            # 2. 更新中心频率omega（修复核心：保持[B, L, D]维度求和，避免展平）
             for k_idx in range(self.k):
-                u_k = u[:, k_idx]  # [B, L, D]
-                u_k_hat = torch.fft.fftshift(torch.fft.fft(u_k, dim=1), dim=1)  # [B, L, D]
-                # 能量加权计算中心频率（仅正频率部分，避免冗余）
-                f_pos = f_shifted[f_shifted >= 0]  # 正频率点
-                idx_pos = f_shifted >= 0  # 正频率掩码
-                numerator_omega = torch.sum(f_shifted[idx_pos] * torch.abs(u_k_hat[idx_pos]) ** 2, dim=1)  # [B, D]
-                denominator_omega = torch.sum(torch.abs(u_k_hat[idx_pos]) ** 2, dim=1) + self.eps  # [B, D]
-                omega[:, k_idx] = numerator_omega / denominator_omega  # [B, D]
+                u_k = u[:, k_idx]  # 当前模态时域信号 [B, L, D]
+                u_k_hat = torch.fft.fftshift(torch.fft.fft(u_k, dim=1), dim=1)  # 傅里叶域 [B, L, D]
 
-            # 3. 更新对偶变量lambda（梯度上升）
-            sum_u = torch.sum(u, dim=1)  # [B, L, D]
+                # 步骤1：生成正频率掩码（保持[B, L, D]维度，不展平）
+                idx_pos = f_shifted >= 0  # [B, L, D]（布尔掩码，True表示正频率）
+                # 步骤2：将负频率部分置0（替代[idx_pos]切片，避免维度丢失）
+                f_pos = torch.where(idx_pos, f_shifted, torch.tensor(0.0, device=device))  # [B, L, D]
+                u_k_hat_pos = torch.where(idx_pos, u_k_hat, torch.tensor(0.0, device=device))  # [B, L, D]
+
+                # 步骤3：对时序维度（dim=1）求和（此时维度正确，不会报错）
+                numerator_omega = torch.sum(f_pos * torch.abs(u_k_hat_pos) ** 2, dim=1)  # [B, D]（按L求和）
+                denominator_omega = torch.sum(torch.abs(u_k_hat_pos) ** 2, dim=1) + self.eps  # [B, D]
+                omega[:, k_idx] = numerator_omega / denominator_omega  # [B, D]（更新当前模态频率）
+
+            # 3. 更新对偶变量lambda（梯度上升，保持维度）
+            sum_u = torch.sum(u, dim=1)  # [B, L, D]（所有模态求和）
             lambda_ = lambda_ + self.tau * (x - sum_u)  # [B, L, D]
 
-        # 按频率排序：低频（趋势）→ 中频（周期）→ 高频（残差）
-        omega_mean = omega.mean(dim=2).squeeze(-1)  # [B, k]，各模态平均频率
-        sorted_indices = torch.argsort(omega_mean, dim=1)  # [B, k]，按频率升序的索引
+        # 按频率排序：低频（趋势）→ 中频（周期）→ 高频（残差）（修复维度：删除多余squeeze）
+        omega_mean = omega.mean(dim=2)  # [B, k]（对特征维度求平均，得到每个模态的平均频率）
+        sorted_indices = torch.argsort(omega_mean, dim=1)  # [B, k]（按频率升序排序的索引）
 
-        # 对每个样本按频率排序模态，确保输出顺序固定为：趋势（0）、周期（1）、残差（2）
+        # 对每个样本按频率重新排列模态（确保输出顺序固定）
         u_sorted = torch.zeros_like(u)  # [B, k, L, D]
         for b in range(B):
-            u_sorted[b] = u[b, sorted_indices[b]]
+            u_sorted[b] = u[b, sorted_indices[b]]  # 按排序索引重排当前样本的模态
 
-        # 返回三个成分（取前3个模态，若k>3则截断，k=3时正好对应）
+        # 返回三个成分（k=3时正好对应趋势、周期、残差）
         x_trend, x_period, x_res = u_sorted[:, 0], u_sorted[:, 1], u_sorted[:, 2]
         return x_trend, x_period, x_res
 
 
-# -------------------------- 模块2：CNN增强模块（深度可分离卷积） --------------------------
+# -------------------------- 模块2：CNN增强模块（无修改） --------------------------
 class CNNEnhance(nn.Module):
     """
     基于深度可分离卷积的Patch特征增强模块，补全Patch内部局部依赖
@@ -145,7 +150,7 @@ class CNNEnhance(nn.Module):
         return x
 
 
-# -------------------------- 模块3：稀疏注意力模块 --------------------------
+# -------------------------- 模块3：稀疏注意力模块（无修改） --------------------------
 class SparseAttention(nn.Module):
     """
     稀疏注意力模块：保留top-T%的注意力权重，过滤冗余依赖
@@ -196,7 +201,7 @@ class SparseAttention(nn.Module):
             return V.contiguous(), None
 
 
-# -------------------------- 辅助模块 --------------------------
+# -------------------------- 辅助模块（无修改） --------------------------
 class Transpose(nn.Module):
     def __init__(self, *dims, contiguous=False): 
         super().__init__()
@@ -221,6 +226,7 @@ class FlattenHead(nn.Module):
         return x
 
 
+# -------------------------- 核心Model类（无修改，仅依赖修复后的VMD） --------------------------
 class Model(nn.Module):
     """
     改进版Decomp-CNN-PatchTST：集成VMD分解、CNN增强、稀疏注意力
