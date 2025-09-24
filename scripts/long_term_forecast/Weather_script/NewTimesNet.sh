@@ -24,7 +24,6 @@ python -u run.py \
   --n_heads 4 \
   --train_epochs 3 \
   --patch_len 16 \
-  --stride 8 \
   --des 'Exp' \
   --itr 1
 
@@ -50,7 +49,6 @@ python -u run.py \
   --n_heads 16 \
   --train_epochs 3 \
   --patch_len 16 \
-  --stride 8 \
   --des 'Exp' \
   --itr 1
 
@@ -77,7 +75,6 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 3 \
   --patch_len 16 \
-  --stride 8 \
   --des 'Exp' \
   --itr 1
 
@@ -104,6 +101,5 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 3 \
   --patch_len 16 \
-  --stride 8 \
   --des 'Exp' \
   --itr 1
