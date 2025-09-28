@@ -6,6 +6,60 @@ from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
 
+class ConvNeXt_Block(nn.Module):
+    """
+    Simplified ConvNeXt block for TimesNet backbone replacement
+    Based on: https://arxiv.org/abs/2201.03545
+    """
+    def __init__(self, in_channels, out_channels, num_kernels=6, init_weight=True):
+        super(ConvNeXt_Block, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # Depthwise convolution (equivalent to groups=in_channels)
+        self.dw_conv = nn.Conv2d(in_channels, in_channels, kernel_size=7, 
+                                padding=3, groups=in_channels)
+        
+        # Pointwise convolution (1x1) for channel expansion/reduction
+        self.pw_conv1 = nn.Conv2d(in_channels, in_channels * 4, kernel_size=1)
+        self.pw_conv2 = nn.Conv2d(in_channels * 4, out_channels, kernel_size=1)
+        
+        # Layer normalization and activation
+        self.norm = nn.LayerNorm(in_channels)
+        self.act = nn.GELU()
+        
+        if init_weight:
+            self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # Save residual
+        residual = x
+        
+        # Depthwise convolution
+        x = self.dw_conv(x)
+        
+        # LayerNorm (transpose for channel last format)
+        x = x.permute(0, 2, 3, 1)  # [B, H, W, C]
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)  # [B, C, H, W]
+        
+        # Pointwise convolution with expansion
+        x = self.pw_conv1(x)
+        x = self.act(x)
+        x = self.pw_conv2(x)
+        
+        # Add residual connection
+        x = x + residual
+        return x
+
+
 def FFT_for_Period(x, k=2):
     # [B, T, C]
     xf = torch.fft.rfft(x, dim=1)
@@ -24,13 +78,11 @@ class TimesBlock(nn.Module):
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
-        # parameter-efficient design
+        # parameter-efficient design - replaced Inception_Block_V1 with ConvNeXt_Block
         self.conv = nn.Sequential(
-            Inception_Block_V1(configs.d_model, configs.d_ff,
-                               num_kernels=configs.num_kernels),
+            ConvNeXt_Block(configs.d_model, configs.d_ff, num_kernels=configs.num_kernels),
             nn.GELU(),
-            Inception_Block_V1(configs.d_ff, configs.d_model,
-                               num_kernels=configs.num_kernels)
+            ConvNeXt_Block(configs.d_ff, configs.d_model, num_kernels=configs.num_kernels)
         )
 
     def forward(self, x):
