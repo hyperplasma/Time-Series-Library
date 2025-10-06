@@ -9,7 +9,7 @@ from layers.Conv_Blocks import Inception_Block_V1
 
 
 class EnhancedFFTPeriodDetection:
-    """增强的FFT周期检测：基于最新研究的实质性改进"""
+    """增强的FFT周期检测"""
     
     def __init__(self, top_k=2, wavelet='db4'):
         self.top_k = top_k
@@ -30,7 +30,7 @@ class EnhancedFFTPeriodDetection:
         return validated_periods, adjusted_weights
     
     def _multi_resolution_fft(self, x):
-        """多分辨率FFT分析 - 核心改进"""
+        """多分辨率FFT分析 - 修复尺寸匹配问题"""
         B, T, C = x.shape
         
         # 方法1: 原始FFT
@@ -38,30 +38,53 @@ class EnhancedFFTPeriodDetection:
         freq_list_full = abs(xf_full).mean(0).mean(-1)
         freq_list_full[0] = 0
         
-        # 方法2: 滑动窗口FFT（捕捉局部周期性）
+        # 方法2: 滑动窗口FFT - 修复版本
         window_size = T // 4
         if window_size > 10:
             local_freqs = []
             for start in range(0, T - window_size, window_size // 2):
+                if start + window_size > T:
+                    break
+                    
                 window_data = x[:, start:start + window_size, :]
                 xf_local = torch.fft.rfft(window_data, dim=1)
                 local_freq = abs(xf_local).mean(0).mean(-1)
                 local_freq[0] = 0
-                local_freqs.append(local_freq)
+                
+                # 关键修复: 插值到相同尺寸
+                if len(local_freq) != len(freq_list_full):
+                    # 使用线性插值匹配尺寸
+                    local_freq_resized = F.interpolate(
+                        local_freq.unsqueeze(0).unsqueeze(0), 
+                        size=len(freq_list_full), 
+                        mode='linear',
+                        align_corners=False
+                    ).squeeze()
+                else:
+                    local_freq_resized = local_freq
+                    
+                local_freqs.append(local_freq_resized)
             
             # 聚合局部频率信息
             if local_freqs:
                 local_freq_tensor = torch.stack(local_freqs).mean(0)
-                freq_list_full = 0.7 * freq_list_full + 0.3 * local_freq_tensor
+                # 确保尺寸匹配
+                if local_freq_tensor.shape == freq_list_full.shape:
+                    freq_list_full = 0.7 * freq_list_full + 0.3 * local_freq_tensor
         
         # 方法3: 多通道协同分析
         channel_correlations = []
         for i in range(min(C, 5)):  # 限制通道数以减少计算
             for j in range(i + 1, min(C, 5)):
-                corr = torch.corrcoef(torch.stack([x[:, :, i].flatten(), 
-                                                 x[:, :, j].flatten()]))[0, 1]
-                if not torch.isnan(corr):
-                    channel_correlations.append(corr.abs())
+                # 修复相关系数计算
+                x_i = x[:, :, i].flatten()
+                x_j = x[:, :, j].flatten()
+                if x_i.std() > 1e-8 and x_j.std() > 1e-8:  # 避免除零
+                    corr_matrix = torch.corrcoef(torch.stack([x_i, x_j]))
+                    if corr_matrix.shape == (2, 2):
+                        corr = corr_matrix[0, 1]
+                        if not torch.isnan(corr):
+                            channel_correlations.append(corr.abs())
         
         if channel_correlations:
             avg_correlation = torch.mean(torch.stack(channel_correlations))
@@ -209,11 +232,24 @@ class EnhancedTimesBlock(nn.Module):
         # 使用增强的周期检测
         period_list, period_weight = self.period_detector(x)
         
+        # 确保period_list是numpy数组格式
+        if isinstance(period_list, np.ndarray):
+            period_array = period_list
+        else:
+            period_array = period_list.detach().cpu().numpy() if hasattr(period_list, 'detach') else period_list
+        
         res = []
         adapter_weights = []
         
         for i in range(self.k):
-            period = period_list[i] if isinstance(period_list, np.ndarray) else period_list[0, i]
+            # 安全地获取周期值
+            if period_array.ndim == 1:
+                period = period_array[i]
+            else:
+                period = period_array[0, i]  # 取第一个batch
+            
+            # 确保周期是整数
+            period = int(period)
             
             # 智能周期调整
             if period < 2 or period > (self.seq_len + self.pred_len) // 2:
