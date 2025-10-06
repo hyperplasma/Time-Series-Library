@@ -6,60 +6,6 @@ from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
 
-class ConvNeXt_Block(nn.Module):
-    """
-    Simplified ConvNeXt block for TimesNet backbone replacement
-    Based on: https://arxiv.org/abs/2201.03545
-    """
-    def __init__(self, in_channels, out_channels, num_kernels=6, init_weight=True):
-        super(ConvNeXt_Block, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        
-        # Depthwise convolution (equivalent to groups=in_channels)
-        self.dw_conv = nn.Conv2d(in_channels, in_channels, kernel_size=7, 
-                                padding=3, groups=in_channels)
-        
-        # Pointwise convolution (1x1) for channel expansion/reduction
-        self.pw_conv1 = nn.Conv2d(in_channels, in_channels * 4, kernel_size=1)
-        self.pw_conv2 = nn.Conv2d(in_channels * 4, out_channels, kernel_size=1)
-        
-        # Layer normalization and activation
-        self.norm = nn.LayerNorm(in_channels)
-        self.act = nn.GELU()
-        
-        if init_weight:
-            self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        # Save residual
-        residual = x
-        
-        # Depthwise convolution
-        x = self.dw_conv(x)
-        
-        # LayerNorm (transpose for channel last format)
-        x = x.permute(0, 2, 3, 1)  # [B, H, W, C]
-        x = self.norm(x)
-        x = x.permute(0, 3, 1, 2)  # [B, C, H, W]
-        
-        # Pointwise convolution with expansion
-        x = self.pw_conv1(x)
-        x = self.act(x)
-        x = self.pw_conv2(x)
-        
-        # Add residual connection
-        x = x + residual
-        return x
-
-
 def FFT_for_Period(x, k=2):
     # [B, T, C]
     xf = torch.fft.rfft(x, dim=1)
@@ -72,17 +18,92 @@ def FFT_for_Period(x, k=2):
     return period, abs(xf).mean(-1)[:, top_list]
 
 
+class ChannelAttention2D(nn.Module):
+    """2D通道注意力模块 - 类似SE模块但更轻量"""
+    def __init__(self, channels, reduction=16):
+        super(ChannelAttention2D, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # 参数高效的注意力设计
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        b, c, h, w = x.size()
+        
+        # 平均池化分支
+        avg_out = self.avg_pool(x).view(b, c)
+        avg_out = self.fc(avg_out).view(b, c, 1, 1)
+        
+        # 最大池化分支  
+        max_out = self.max_pool(x).view(b, c)
+        max_out = self.fc(max_out).view(b, c, 1, 1)
+        
+        # 融合并应用sigmoid
+        out = self.sigmoid(avg_out + max_out)
+        return x * out
+
+
+class EnhancedInceptionBlock(nn.Module):
+    """增强的Inception块，包含通道注意力"""
+    def __init__(self, in_channels, out_channels, num_kernels=6, reduction=16):
+        super(EnhancedInceptionBlock, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.num_kernels = num_kernels
+        
+        # 原有的多尺度卷积
+        kernels = []
+        for i in range(self.num_kernels):
+            kernels.append(nn.Conv2d(in_channels, out_channels, 
+                                   kernel_size=2 * i + 1, padding=i))
+        self.kernels = nn.ModuleList(kernels)
+        
+        # 新增的通道注意力
+        self.channel_attention = ChannelAttention2D(out_channels, reduction)
+        
+        # 初始化权重
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        res_list = []
+        for i in range(self.num_kernels):
+            conv_out = self.kernels[i](x)
+            # 对每个卷积分支应用通道注意力
+            attended_out = self.channel_attention(conv_out)
+            res_list.append(attended_out)
+        
+        # 多分支融合
+        res = torch.stack(res_list, dim=-1).mean(-1)
+        return res
+
+
 class TimesBlock(nn.Module):
     def __init__(self, configs):
         super(TimesBlock, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
-        # parameter-efficient design - replaced Inception_Block_V1 with ConvNeXt_Block
+        
+        # 使用增强的Inception块替换原有结构
         self.conv = nn.Sequential(
-            ConvNeXt_Block(configs.d_model, configs.d_ff, num_kernels=configs.num_kernels),
+            EnhancedInceptionBlock(configs.d_model, configs.d_ff,
+                                  num_kernels=configs.num_kernels),
             nn.GELU(),
-            ConvNeXt_Block(configs.d_ff, configs.d_model, num_kernels=configs.num_kernels)
+            EnhancedInceptionBlock(configs.d_ff, configs.d_model,
+                                  num_kernels=configs.num_kernels)
         )
 
     def forward(self, x):
