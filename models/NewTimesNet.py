@@ -18,40 +18,40 @@ def FFT_for_Period(x, k=2):
     return period, abs(xf).mean(-1)[:, top_list]
 
 
-class ChannelAttention2D(nn.Module):
-    """2D通道注意力模块 - 类似SE模块但更轻量"""
-    def __init__(self, channels, reduction=16):
-        super(ChannelAttention2D, self).__init__()
+class ECALayer(nn.Module):
+    """高效通道注意力模块"""
+    def __init__(self, channels, k_size=3):
+        super(ECALayer, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
         
-        # 参数高效的注意力设计
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False)
-        )
+        # 自适应选择卷积核大小
+        self.k_size = k_size
+        if k_size % 2 == 0:
+            k_size += 1
+            
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, 
+                             padding=(k_size - 1) // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
-    
+
     def forward(self, x):
+        # x: [B, C, H, W]
         b, c, h, w = x.size()
         
-        # 平均池化分支
-        avg_out = self.avg_pool(x).view(b, c)
-        avg_out = self.fc(avg_out).view(b, c, 1, 1)
+        # 特征描述符
+        y = self.avg_pool(x)  # [B, C, 1, 1]
+        y = y.squeeze(-1).transpose(-1, -2)  # [B, 1, C]
         
-        # 最大池化分支  
-        max_out = self.max_pool(x).view(b, c)
-        max_out = self.fc(max_out).view(b, c, 1, 1)
+        # 一维卷积捕捉局部跨通道交互
+        y = self.conv(y)  # [B, 1, C]
+        y = self.sigmoid(y)
+        y = y.transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
         
-        # 融合并应用sigmoid
-        out = self.sigmoid(avg_out + max_out)
-        return x * out
+        return x * y.expand_as(x)
 
 
 class EnhancedInceptionBlock(nn.Module):
-    """增强的Inception块，包含通道注意力"""
-    def __init__(self, in_channels, out_channels, num_kernels=6, reduction=16):
+    """增强的Inception块，包含ECA注意力"""
+    def __init__(self, in_channels, out_channels, num_kernels=6):
         super(EnhancedInceptionBlock, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -64,8 +64,8 @@ class EnhancedInceptionBlock(nn.Module):
                                    kernel_size=2 * i + 1, padding=i))
         self.kernels = nn.ModuleList(kernels)
         
-        # 新增的通道注意力
-        self.channel_attention = ChannelAttention2D(out_channels, reduction)
+        # 新增的ECA注意力（放在多尺度融合后）
+        self.eca = ECALayer(out_channels)
         
         # 初始化权重
         self._initialize_weights()
@@ -81,12 +81,14 @@ class EnhancedInceptionBlock(nn.Module):
         res_list = []
         for i in range(self.num_kernels):
             conv_out = self.kernels[i](x)
-            # 对每个卷积分支应用通道注意力
-            attended_out = self.channel_attention(conv_out)
-            res_list.append(attended_out)
+            res_list.append(conv_out)
         
         # 多分支融合
         res = torch.stack(res_list, dim=-1).mean(-1)
+        
+        # 应用ECA注意力
+        res = self.eca(res)
+        
         return res
 
 
