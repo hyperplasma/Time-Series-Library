@@ -18,40 +18,63 @@ def FFT_for_Period(x, k=2):
     return period, abs(xf).mean(-1)[:, top_list]
 
 
-class ECALayer(nn.Module):
-    """高效通道注意力模块"""
-    def __init__(self, channels, k_size=3):
-        super(ECALayer, self).__init__()
+class ChannelAttention(nn.Module):
+    """CBAM的通道注意力部分"""
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
         
-        # 自适应选择卷积核大小
-        self.k_size = k_size
-        if k_size % 2 == 0:
-            k_size += 1
-            
-        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, 
-                             padding=(k_size - 1) // 2, bias=False)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
+        )
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # x: [B, C, H, W]
-        b, c, h, w = x.size()
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    """CBAM的空间注意力部分"""
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
         
-        # 特征描述符
-        y = self.avg_pool(x)  # [B, C, 1, 1]
-        y = y.squeeze(-1).transpose(-1, -2)  # [B, 1, C]
-        
-        # 一维卷积捕捉局部跨通道交互
-        y = self.conv(y)  # [B, 1, C]
-        y = self.sigmoid(y)
-        y = y.transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
-        
-        return x * y.expand_as(x)
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_combined = torch.cat([avg_out, max_out], dim=1)
+        attention_map = self.conv(x_combined)
+        return self.sigmoid(attention_map)
+
+
+class CBAMBlock(nn.Module):
+    """完整的CBAM注意力模块"""
+    def __init__(self, channels, reduction_ratio=16, spatial_kernel=7):
+        super(CBAMBlock, self).__init__()
+        self.channel_attention = ChannelAttention(channels, reduction_ratio)
+        self.spatial_attention = SpatialAttention(spatial_kernel)
+
+    def forward(self, x):
+        # 通道注意力
+        x = x * self.channel_attention(x)
+        # 空间注意力
+        x = x * self.spatial_attention(x)
+        return x
 
 
 class EnhancedInceptionBlock(nn.Module):
-    """增强的Inception块，包含ECA注意力"""
-    def __init__(self, in_channels, out_channels, num_kernels=6):
+    """增强的Inception块，包含CBAM注意力"""
+    def __init__(self, in_channels, out_channels, num_kernels=6, reduction_ratio=16):
         super(EnhancedInceptionBlock, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -64,8 +87,8 @@ class EnhancedInceptionBlock(nn.Module):
                                    kernel_size=2 * i + 1, padding=i))
         self.kernels = nn.ModuleList(kernels)
         
-        # 新增的ECA注意力（放在多尺度融合后）
-        self.eca = ECALayer(out_channels)
+        # 新增的CBAM注意力
+        self.cbam = CBAMBlock(out_channels, reduction_ratio)
         
         # 初始化权重
         self._initialize_weights()
@@ -86,8 +109,8 @@ class EnhancedInceptionBlock(nn.Module):
         # 多分支融合
         res = torch.stack(res_list, dim=-1).mean(-1)
         
-        # 应用ECA注意力
-        res = self.eca(res)
+        # 应用CBAM注意力
+        res = self.cbam(res)
         
         return res
 
