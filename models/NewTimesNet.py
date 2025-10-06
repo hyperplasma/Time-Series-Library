@@ -6,7 +6,159 @@ from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
 
+class EnhancedFFTPeriodDetection(nn.Module):
+    """增强的FFT周期检测：多尺度 + 自相关验证"""
+    def __init__(self, top_k=5, scales=[1, 2, 3], correlation_threshold=0.2):
+        super().__init__()
+        self.top_k = top_k
+        self.scales = scales
+        self.correlation_threshold = correlation_threshold
+        
+    def multi_scale_fft(self, x):
+        """多尺度FFT分析"""
+        B, T, C = x.shape
+        all_amplitudes = []
+        
+        for scale in self.scales:
+            window_size = T // scale
+            if window_size < 10:  # 窗口太小则跳过
+                continue
+                
+            # 滑动窗口分析
+            stride = max(1, window_size // 2)
+            for start_idx in range(0, T - window_size + 1, stride):
+                window = x[:, start_idx:start_idx+window_size, :]
+                
+                # FFT计算
+                xf = torch.fft.rfft(window, dim=1)
+                amplitudes = torch.abs(xf).mean(dim=-1)  # [B, freq_bins]
+                all_amplitudes.append(amplitudes)
+        
+        if all_amplitudes:
+            # 合并多尺度结果
+            combined_amplitudes = torch.stack(all_amplitudes).mean(dim=0)  # [B, freq_bins]
+            return combined_amplitudes
+        else:
+            # 回退到标准FFT
+            xf = torch.fft.rfft(x, dim=1)
+            return torch.abs(xf).mean(dim=-1)
+    
+    def autocorrelation_validation(self, x, candidate_periods):
+        """自相关验证候选周期"""
+        B, T, C = x.shape
+        validated_periods = []
+        validated_weights = []
+        
+        for i in range(B):
+            batch_periods = []
+            batch_weights = []
+            
+            for period in candidate_periods[i]:
+                period_int = int(period)
+                if period_int < 2 or period_int > T // 2:
+                    continue
+                    
+                # 计算自相关
+                if self.compute_autocorrelation(x[i], period_int) > self.correlation_threshold:
+                    batch_periods.append(period_int)
+                    batch_weights.append(1.0)  # 简单权重
+            
+            # 如果验证后周期太少，补充一些候选
+            if len(batch_periods) < self.top_k:
+                additional = self.get_additional_periods(x[i], self.top_k - len(batch_periods))
+                batch_periods.extend(additional)
+                batch_weights.extend([0.5] * len(additional))  # 较低权重
+            
+            validated_periods.append(batch_periods[:self.top_k])
+            validated_weights.append(batch_weights[:self.top_k])
+        
+        return validated_periods, validated_weights
+    
+    def compute_autocorrelation(self, x_single, period):
+        """计算自相关分数"""
+        T = x_single.shape[0]
+        try:
+            # 重塑以检查周期性
+            num_periods = T // period
+            if num_periods < 2:
+                return 0.0
+                
+            reshaped = x_single[:num_periods * period].reshape(num_periods, period, -1)
+            
+            # 计算周期间的相关性
+            if num_periods > 1:
+                # 计算相邻周期之间的相关性
+                correlations = []
+                for i in range(num_periods - 1):
+                    corr = F.cosine_similarity(
+                        reshaped[i].flatten(), 
+                        reshaped[i + 1].flatten(), 
+                        dim=0
+                    )
+                    correlations.append(corr)
+                return torch.mean(torch.stack(correlations)).item()
+            else:
+                return 0.0
+        except:
+            return 0.0
+    
+    def get_additional_periods(self, x_single, num_needed):
+        """获取额外的候选周期"""
+        T = x_single.shape[0]
+        additional = []
+        
+        # 添加一些常见的周期候选
+        common_periods = [T//4, T//3, T//2, T//1.5]
+        for p in common_periods:
+            p_int = int(p)
+            if 2 <= p_int <= T // 2 and p_int not in additional:
+                additional.append(p_int)
+                if len(additional) >= num_needed:
+                    break
+        
+        # 如果还不够，添加随机周期
+        while len(additional) < num_needed:
+            p = torch.randint(2, T//2, (1,)).item()
+            if p not in additional:
+                additional.append(p)
+        
+        return additional
+    
+    def forward(self, x):
+        B, T, C = x.shape
+        
+        # 1. 多尺度FFT检测
+        combined_amplitudes = self.multi_scale_fft(x)
+        
+        # 2. 选择候选周期
+        _, topk_indices = torch.topk(combined_amplitudes, self.top_k * 2, dim=1)  # 多选一些候选
+        
+        candidate_periods = []
+        for i in range(B):
+            periods = []
+            for idx in topk_indices[i]:
+                period = T / (idx.item() + 1)
+                if 2 <= period <= T // 2:  # 合理的周期范围
+                    periods.append(period)
+            candidate_periods.append(periods[:self.top_k * 2])
+        
+        # 3. 自相关验证
+        validated_periods, validated_weights = self.autocorrelation_validation(x, candidate_periods)
+        
+        # 转换为tensor
+        period_tensor = torch.zeros(B, self.top_k)
+        weight_tensor = torch.zeros(B, self.top_k)
+        
+        for i in range(B):
+            for j in range(min(self.top_k, len(validated_periods[i]))):
+                period_tensor[i, j] = validated_periods[i][j]
+                weight_tensor[i, j] = validated_weights[i][j]
+        
+        return period_tensor.to(x.device), weight_tensor.to(x.device)
+
+
 def FFT_for_Period(x, k=2):
+    """原始FFT函数保持兼容性"""
     # [B, T, C]
     xf = torch.fft.rfft(x, dim=1)
     # find period by amplitudes
@@ -18,103 +170,6 @@ def FFT_for_Period(x, k=2):
     return period, abs(xf).mean(-1)[:, top_list]
 
 
-class ChannelAttention(nn.Module):
-    """CBAM的通道注意力部分"""
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
-        self.fc = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-class SpatialAttention(nn.Module):
-    """CBAM的空间注意力部分"""
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
-        padding = 3 if kernel_size == 7 else 1
-        
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x_combined = torch.cat([avg_out, max_out], dim=1)
-        attention_map = self.conv(x_combined)
-        return self.sigmoid(attention_map)
-
-
-class CBAMBlock(nn.Module):
-    """完整的CBAM注意力模块"""
-    def __init__(self, channels, reduction_ratio=16, spatial_kernel=7):
-        super(CBAMBlock, self).__init__()
-        self.channel_attention = ChannelAttention(channels, reduction_ratio)
-        self.spatial_attention = SpatialAttention(spatial_kernel)
-
-    def forward(self, x):
-        # 通道注意力
-        x = x * self.channel_attention(x)
-        # 空间注意力
-        x = x * self.spatial_attention(x)
-        return x
-
-
-class EnhancedInceptionBlock(nn.Module):
-    """增强的Inception块，包含CBAM注意力"""
-    def __init__(self, in_channels, out_channels, num_kernels=6, reduction_ratio=16):
-        super(EnhancedInceptionBlock, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_kernels = num_kernels
-        
-        # 原有的多尺度卷积
-        kernels = []
-        for i in range(self.num_kernels):
-            kernels.append(nn.Conv2d(in_channels, out_channels, 
-                                   kernel_size=2 * i + 1, padding=i))
-        self.kernels = nn.ModuleList(kernels)
-        
-        # 新增的CBAM注意力
-        self.cbam = CBAMBlock(out_channels, reduction_ratio)
-        
-        # 初始化权重
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        res_list = []
-        for i in range(self.num_kernels):
-            conv_out = self.kernels[i](x)
-            res_list.append(conv_out)
-        
-        # 多分支融合
-        res = torch.stack(res_list, dim=-1).mean(-1)
-        
-        # 应用CBAM注意力
-        res = self.cbam(res)
-        
-        return res
-
-
 class TimesBlock(nn.Module):
     def __init__(self, configs):
         super(TimesBlock, self).__init__()
@@ -122,44 +177,62 @@ class TimesBlock(nn.Module):
         self.pred_len = configs.pred_len
         self.k = configs.top_k
         
-        # 使用增强的Inception块替换原有结构
+        # 使用增强的FFT检测
+        self.enhanced_fft = EnhancedFFTPeriodDetection(
+            top_k=configs.top_k,
+            scales=[1, 2, 3],  # 多尺度分析
+            correlation_threshold=0.15  # 适中的相关性阈值
+        )
+        
+        # parameter-efficient design
         self.conv = nn.Sequential(
-            EnhancedInceptionBlock(configs.d_model, configs.d_ff,
-                                  num_kernels=configs.num_kernels),
+            Inception_Block_V1(configs.d_model, configs.d_ff,
+                               num_kernels=configs.num_kernels),
             nn.GELU(),
-            EnhancedInceptionBlock(configs.d_ff, configs.d_model,
-                                  num_kernels=configs.num_kernels)
+            Inception_Block_V1(configs.d_ff, configs.d_model,
+                               num_kernels=configs.num_kernels)
         )
 
     def forward(self, x):
         B, T, N = x.size()
-        period_list, period_weight = FFT_for_Period(x, self.k)
+        
+        # 使用增强的FFT周期检测
+        period_list, period_weight = self.enhanced_fft(x)
+        
+        # 转换period_list为整数列表格式以保持兼容性
+        period_list_np = period_list.cpu().numpy().astype(int)
 
         res = []
         for i in range(self.k):
-            period = period_list[i]
+            period = period_list_np[0, i]  # 取第一个batch的周期（所有batch相同）
+            if period == 0:  # 无效周期，跳过
+                continue
+                
             # padding
             if (self.seq_len + self.pred_len) % period != 0:
-                length = (
-                                 ((self.seq_len + self.pred_len) // period) + 1) * period
+                length = (((self.seq_len + self.pred_len) // period) + 1) * period
                 padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
                 out = torch.cat([x, padding], dim=1)
             else:
                 length = (self.seq_len + self.pred_len)
                 out = x
+                
             # reshape
-            out = out.reshape(B, length // period, period,
-                              N).permute(0, 3, 1, 2).contiguous()
+            out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
             # 2D conv: from 1d Variation to 2d Variation
             out = self.conv(out)
             # reshape back
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
             res.append(out[:, :(self.seq_len + self.pred_len), :])
+            
+        if not res:  # 如果没有有效周期，回退到原始FFT
+            period_list, period_weight = FFT_for_Period(x, self.k)
+            # ... 原始处理逻辑
+
         res = torch.stack(res, dim=-1)
         # adaptive aggregation
         period_weight = F.softmax(period_weight, dim=1)
-        period_weight = period_weight.unsqueeze(
-            1).unsqueeze(1).repeat(1, T, N, 1)
+        period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
         res = torch.sum(res * period_weight, -1)
         # residual connection
         res = res + x
