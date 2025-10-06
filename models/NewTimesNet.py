@@ -76,7 +76,7 @@ def autocorrelation_period_detection(x, max_lag=None):
         x: [B, T, C] 小波近似分量（全局周期信息）
         max_lag: 最大滞后步长（默认T//4，避免周期过大）
     Returns:
-        auto_period: [B, C] 每个通道的自相关周期
+        auto_period: [B] 每个样本的通道平均周期（修正文档描述，原[B,C]错误）
     """
     B, T, C = x.shape
     max_lag = max_lag if max_lag is not None else T // 4
@@ -106,7 +106,8 @@ def autocorrelation_period_detection(x, max_lag=None):
     auto_period = torch.where(autocorr.max(dim=1)[0] < 0.1, 
                               torch.tensor(max_lag, device=x.device), 
                               auto_lag)
-    return auto_period.mean(dim=1).long()  # [B] 批次内通道平均周期
+    # 关键修复：先转浮点计算均值（避免Long型mean错误），再转回长整型（周期需为整数）
+    return auto_period.float().mean(dim=1).long()  # [B] 批次内通道平均周期
 
 
 # -------------------------- 重写：多尺度周期检测（FFT+小波+掩码+一致性验证） --------------------------
