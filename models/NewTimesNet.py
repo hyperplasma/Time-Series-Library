@@ -131,11 +131,11 @@ class VMD(nn.Module):
         for k in range(self.K):
             imfs[k, :] = np.real(np.fft.ifft(np.fft.ifftshift(u_hat[k, :])))
         
-        # -------------------------- 修复：用保存的device和dtype创建张量 --------------------------
+        # 修复：用保存的device和dtype创建张量
         return torch.tensor(imfs, device=device, dtype=dtype)
 
 
-# -------------------------- 新增：VMD周期检测函数 --------------------------
+# -------------------------- 新增：VMD周期检测函数（核心修复） --------------------------
 def vmd_period_detection(x, vmd_model, k=2):
     """
     基于VMD的周期检测：对每个IMF做FFT，取能量最大的IMF对应的周期
@@ -158,15 +158,23 @@ def vmd_period_detection(x, vmd_model, k=2):
             imfs = vmd_model(seq)  # [K, T]
             # 2. 计算每个IMF的能量，选能量最大的IMF（最多2个，避免IMF数量不足导致错误）
             imf_energies = torch.sum(imfs ** 2, dim=1)  # [K,]，K为VMD分解的IMF数量
-            num_imfs = len(imf_energies)  # 获取实际IMF数量
             
+            # 新增：处理IMF能量全为0的极端情况（分解无效，跳过）
+            if torch.all(imf_energies == 0):
+                continue
+            
+            num_imfs = len(imf_energies)  # 获取实际IMF数量
             # 动态调整选取的IMF数量（最多2个，最少1个，避免数量不足）
             n = min(2, num_imfs)
             if n == 0:
                 continue  # 极端情况：无有效IMF，跳过当前通道
             
-            # 取能量最高的n个IMF（升序排序后取最后n个，再反转成降序）
-            top_imf_idx = torch.argsort(imf_energies)[-n:][::-1]  # 能量top-n的IMF索引
+            # 核心修复：用torch.argsort+torch.flip替代切片反转，避免step错误
+            # 步骤1：对能量升序排序，取后n个（top-n能量的IMF索引，升序）
+            sorted_idx_asc = torch.argsort(imf_energies)  # 升序索引
+            top_n_idx_asc = sorted_idx_asc[-n:]  # top-n能量的索引（升序）
+            # 步骤2：用torch.flip反转，得到降序索引（替代[::-1]切片）
+            top_imf_idx = torch.flip(top_n_idx_asc, dims=[0])  # 能量top-n的IMF索引（降序）
             
             # 3. 对每个top-IMF做FFT找周期
             for idx in top_imf_idx:
@@ -243,7 +251,7 @@ class MultiScalePeriodDetector(nn.Module):
         # 3. VMD周期检测
         vmd_periods, vmd_weights = vmd_period_detection(x, self.vmd_model, self.top_k)
 
-        # -------------------------- 基础版本融合规则：投票+能量加权 --------------------------
+        # 基础版本融合规则：投票+能量加权
         # 步骤1：收集所有周期候选（去重）
         all_period_candidates = list(fft_periods) + list(wavelet_periods) + list(vmd_periods)
         unique_periods, counts = np.unique(all_period_candidates, return_counts=True)
