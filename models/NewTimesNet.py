@@ -156,26 +156,59 @@ def vmd_period_detection(x, vmd_model, k=2):
             # 1. VMD分解：得到K个IMF
             seq = x[b, :, c]  # [T,]
             imfs = vmd_model(seq)  # [K, T]
-            # 2. 计算每个IMF的能量，选能量最大的2个IMF（聚焦主要周期）
-            imf_energies = torch.sum(imfs ** 2, dim=1)  # [K,]
-            top_imf_idx = torch.argsort(imf_energies)[-2:][::-1]  # 能量top-2的IMF索引
+            # 2. 计算每个IMF的能量，选能量最大的IMF（最多2个，避免IMF数量不足导致错误）
+            imf_energies = torch.sum(imfs ** 2, dim=1)  # [K,]，K为VMD分解的IMF数量
+            num_imfs = len(imf_energies)  # 获取实际IMF数量
+            
+            # 动态调整选取的IMF数量（最多2个，最少1个，避免数量不足）
+            n = min(2, num_imfs)
+            if n == 0:
+                continue  # 极端情况：无有效IMF，跳过当前通道
+            
+            # 取能量最高的n个IMF（升序排序后取最后n个，再反转成降序）
+            top_imf_idx = torch.argsort(imf_energies)[-n:][::-1]  # 能量top-n的IMF索引
+            
             # 3. 对每个top-IMF做FFT找周期
             for idx in top_imf_idx:
                 imf = imfs[idx, :]
                 xf_imf = torch.fft.rfft(imf)
                 amp_imf = torch.abs(xf_imf)
                 amp_imf[0] = 0  # 排除直流分量
+                
+                # 避免FFT结果过短导致无法获取有效频率（至少需要2个点才能计算周期）
+                if len(amp_imf) <= 1:
+                    continue
+                
                 top_freq_idx = torch.argsort(amp_imf)[-1]  # 每个IMF的主频率
+                # 避免频率索引为0导致周期计算错误（0会导致除零或极大周期）
+                if top_freq_idx == 0:
+                    continue
+                
                 period = T // top_freq_idx  # 对应周期
                 vmd_period_candidates.append(period.item())
                 vmd_energies.append(imf_energies[idx].item())
 
     # 4. 融合周期候选：取出现频次最高的top-k周期（基础版本规则融合）
-    unique_periods, counts = np.unique(vmd_period_candidates, return_counts=True)
-    top_k_idx = np.argsort(counts)[-k:][::-1]
-    vmd_periods = unique_periods[top_k_idx].astype(int)
-    # 5. 计算周期权重：基于IMF能量归一化
-    vmd_weights = torch.ones(B, k, device=x.device) * (np.mean(vmd_energies) / k)
+    # 处理无候选周期的极端情况（用默认周期填充）
+    if len(vmd_period_candidates) == 0:
+        vmd_periods = np.array([T//2] * k)  # 默认周期设为序列长度的一半
+    else:
+        unique_periods, counts = np.unique(vmd_period_candidates, return_counts=True)
+        # 若候选周期数量不足k，用出现次数最多的周期填充
+        if len(unique_periods) < k:
+            most_common = unique_periods[np.argmax(counts)]
+            vmd_periods = np.pad(unique_periods, (0, k - len(unique_periods)), 
+                                mode='constant', constant_values=most_common)
+        else:
+            top_k_idx = np.argsort(counts)[-k:][::-1]
+            vmd_periods = unique_periods[top_k_idx].astype(int)
+    
+    # 5. 计算周期权重：基于IMF能量归一化（处理能量列表为空的极端情况）
+    if len(vmd_energies) == 0:
+        vmd_weights = torch.ones(B, k, device=x.device) / k  # 平均权重
+    else:
+        vmd_weights = torch.ones(B, k, device=x.device) * (np.mean(vmd_energies) / k)
+    
     return vmd_periods, vmd_weights
 
 
