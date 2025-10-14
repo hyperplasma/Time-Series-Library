@@ -3,50 +3,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
 import numpy as np
-# 已安装的pytorch-wavelets库
 from pytorch_wavelets import DWT1D
 from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
 
-# -------------------------- 1. 修复：基于pytorch-wavelets的GPU小波周期检测 --------------------------
+# -------------------------- 1. 修复：用torch.flip替代负步长切片 --------------------------
 def wavelet_period_detection(x, k=2):
-    """
-    修复点：删除DWT1D初始化的'level=1'参数（该库不支持该初始化参数，默认1级分解）
-    """
     B, T, C = x.shape
     wavelet_period_candidates = []
     wavelet_energies = []
 
-    # 修复：DWT1D初始化无'level'参数，默认1级分解（符合需求）
-    dwt = DWT1D(wave='db4', mode='symmetric').to(x.device)  # 仅保留wave和mode参数
-
-    # 调整输入形状为[B, C, T]（符合DWT1D要求：batch, channel, length）
+    # 初始化DWT1D（无level参数）
+    dwt = DWT1D(wave='db4', mode='symmetric').to(x.device)
     x_reshaped = x.permute(0, 2, 1)  # [B, C, T]
+    cA1, _ = dwt(x_reshaped)
+    cA1 = cA1.squeeze(2)  # [B, C, T//2]
 
-    # 批量DWT分解（GPU并行，默认1级，返回低频cA1+高频cD1）
-    cA1, _ = dwt(x_reshaped)  # cA1: [B, C, 1, T//2]
-    cA1 = cA1.squeeze(2)  # 移除冗余维度→[B, C, T//2]
-
-    # 遍历每个样本和通道（内部计算全在GPU）
     for b in range(B):
         for c in range(C):
             cA1_bc = cA1[b, c, :]  # [T//2,]
             if len(cA1_bc) < 2:
                 continue
 
-            # GPU上FFT找周期
             xf_cA1 = torch.fft.rfft(cA1_bc)
             amp_cA1 = torch.abs(xf_cA1)
             amp_cA1[0] = 0  # 排除直流分量
 
-            # 取top-k频率
+            # 修复点1：用torch.flip替代[-k:][::-1]，避免负步长
             if len(amp_cA1) <= k:
+                # 当长度<=k时，直接按降序排序（无需切片反转）
                 top_freq_idx = torch.argsort(amp_cA1, descending=True)
             else:
-                top_freq_idx = torch.argsort(amp_cA1)[-k:][::-1]
+                # 先取最后k个元素（升序中的top-k），再用torch.flip反转成降序
+                top_k_asc = torch.argsort(amp_cA1)[-k:]  # 升序的top-k索引
+                top_freq_idx = torch.flip(top_k_asc, dims=[0])  # 反转成降序
 
-            # 计算周期（映射回原序列长度）
+            # 计算周期
             T_cA1 = cA1_bc.shape[0]
             top_periods = (T_cA1 // top_freq_idx) * 2
 
@@ -56,7 +49,6 @@ def wavelet_period_detection(x, k=2):
             if len(valid_periods) == 0:
                 continue
 
-            # 暂存结果
             wavelet_period_candidates.extend(valid_periods.cpu().numpy().tolist())
             energy_cA1 = torch.sum(cA1_bc ** 2).item()
             wavelet_energies.extend([energy_cA1] * len(valid_periods))
@@ -66,7 +58,7 @@ def wavelet_period_detection(x, k=2):
         wavelet_periods = np.array([T//2] * k)
     else:
         unique_periods, counts = np.unique(wavelet_period_candidates, return_counts=True)
-        top_k_idx = np.argsort(counts)[-k:][::-1]
+        top_k_idx = np.argsort(counts)[-k:][::-1]  # numpy支持负步长，此处无需修改
         wavelet_periods = unique_periods[top_k_idx].astype(int)
 
     # 计算权重
@@ -150,7 +142,7 @@ class VMD(nn.Module):
         return imfs
 
 
-# -------------------------- 3. VMD周期检测（无修改） --------------------------
+# -------------------------- 3. VMD周期检测（确认torch.flip已正确使用） --------------------------
 def vmd_period_detection(x, vmd_model, k=2):
     B, T, C = x.shape
     vmd_period_candidates = []
@@ -170,9 +162,10 @@ def vmd_period_detection(x, vmd_model, k=2):
             if n == 0:
                 continue
 
+            # 此处已使用torch.flip，无需修改
             sorted_idx_asc = torch.argsort(imf_energies)
             top_n_idx_asc = sorted_idx_asc[-n:]
-            top_imf_idx = torch.flip(top_n_idx_asc, dims=[0])
+            top_imf_idx = torch.flip(top_n_idx_asc, dims=[0])  # 正确的反转方式
 
             for idx in top_imf_idx:
                 imf = imfs[idx, :]
@@ -182,7 +175,8 @@ def vmd_period_detection(x, vmd_model, k=2):
                 if len(amp_imf) <= 1:
                     continue
 
-                top_freq_idx = torch.argsort(amp_imf)[-1]
+                # 修复点2：确保此处也用torch.flip处理排序
+                top_freq_idx = torch.flip(torch.argsort(amp_imf)[-1:], dims=[0])[0]  # 取最大频率索引
                 if top_freq_idx == 0:
                     continue
                 period = T // top_freq_idx
@@ -199,7 +193,7 @@ def vmd_period_detection(x, vmd_model, k=2):
             vmd_periods = np.pad(unique_periods, (0, k - len(unique_periods)),
                                 mode='constant', constant_values=most_common)
         else:
-            top_k_idx = np.argsort(counts)[-k:][::-1]
+            top_k_idx = np.argsort(counts)[-k:][::-1]  # numpy支持负步长
             vmd_periods = unique_periods[top_k_idx].astype(int)
 
     vmd_weights = torch.ones(B, k, device=x.device, dtype=x.dtype)
@@ -239,7 +233,7 @@ class MultiScalePeriodDetector(nn.Module):
         else:
             valid_periods = unique_periods[valid_mask]
             valid_counts = counts[valid_mask]
-            top_k_valid_idx = np.argsort(valid_counts)[-self.top_k:][::-1]
+            top_k_valid_idx = np.argsort(valid_counts)[-self.top_k:][::-1]  # numpy支持负步长
             fused_periods = valid_periods[top_k_valid_idx].astype(int)
 
             fused_weights = torch.zeros(B, self.top_k, device=x.device, dtype=x.dtype)
@@ -260,13 +254,17 @@ class MultiScalePeriodDetector(nn.Module):
         return fused_periods, fused_weights
 
 
-# -------------------------- 5. FFT周期检测（无修改） --------------------------
+# -------------------------- 5. FFT周期检测（修复排序逻辑） --------------------------
 def FFT_for_Period(x, k=2):
     xf = torch.fft.rfft(x, dim=1)
     frequency_list = abs(xf).mean(0).mean(-1)
     frequency_list[0] = 0
-    _, top_list = torch.topk(frequency_list, k)
-    top_list = top_list.detach().cpu().numpy()
+
+    # 修复点3：用torch.flip替代[-k:][::-1]
+    sorted_idx_asc = torch.argsort(frequency_list)  # 升序索引
+    top_k_asc = sorted_idx_asc[-k:]  # 取最后k个（top-k）
+    top_list = torch.flip(top_k_asc, dims=[0]).detach().cpu().numpy()  # 反转成降序
+
     period = x.shape[1] // top_list
     weights = abs(xf).mean(-1)[:, top_list]
     return period, weights
