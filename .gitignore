@@ -170,3 +170,5 @@ environment.txt
 .vscode
 .DS_Store
 .idea
+
+test/
