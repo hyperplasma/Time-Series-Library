@@ -76,12 +76,16 @@ class VMD(nn.Module):
         Returns:
             imfs: [K, T] K个固有模态函数（IMF）
         """
-        x = x.detach().cpu().numpy()
-        T = len(x)
-        t = np.arange(1, T + 1) / T  # 时间轴
-        freqs = t - 0.5 - 1 / T      # 频率轴
+        device = x.device  # 保存原设备（如cuda:0或cpu）
+        dtype = x.dtype    # 保存原数据类型（如float32）
+        
+        # 再转换为numpy数组处理（后续逻辑不变）
+        x_np = x.detach().cpu().numpy()  # 变量名改为x_np，避免和原x混淆
+        T = len(x_np)
+        t = np.arange(1, T + 1) / T  
+        freqs = t - 0.5 - 1 / T      
 
-        # 初始化：权重、IMF、拉格朗日乘子
+        # 初始化（后续逻辑不变，仅将所有x改为x_np）
         u_hat = np.zeros((self.K, T), dtype=np.complex_)
         u_hat_prev = np.zeros((self.K, T), dtype=np.complex_)
         omega = np.zeros(self.K)
@@ -92,34 +96,28 @@ class VMD(nn.Module):
         lambda_hat = np.zeros((1, T), dtype=np.complex_)
         lambda_hat_prev = np.zeros((1, T), dtype=np.complex_)
 
-        # 傅里叶变换（中心化）
-        f_hat = np.fft.fftshift(np.fft.fft(x))
+        # 傅里叶变换（用x_np计算，后续逻辑不变）
+        f_hat = np.fft.fftshift(np.fft.fft(x_np))
         f_hat_conj = np.conj(f_hat)
 
-        # VMD迭代（基础版本：固定迭代50次，平衡效率与效果）
+        # VMD迭代（后续逻辑不变，所有涉及x的地方都用x_np，这里没有用到，所以无需改）
         for n in range(50):
-            # 1. 更新IMF的频谱
             for k in range(self.K):
-                # 计算分母
                 denom = (freqs - omega[k]) ** 2 + self.tau ** 2
                 if k > 0:
                     denom += (freqs - omega[k-1]) ** 2
                 if k < self.K - 1:
                     denom += (freqs - omega[k+1]) ** 2
-                # 更新当前IMF的频谱
                 u_hat[k, :] = (f_hat - lambda_hat_prev / 2) / (1 + self.alpha * denom)
             
-            # 2. 更新频率中心（按能量加权）
             for k in range(self.K):
                 if not self.DC:
                     omega[k] = np.sum(freqs * np.abs(u_hat[k, :]) ** 2) / np.sum(np.abs(u_hat[k, :]) ** 2)
                 else:
-                    omega[k] = 0  # DC分量频率为0
+                    omega[k] = 0
 
-            # 3. 更新拉格朗日乘子
             lambda_hat = lambda_hat_prev + self.tau * (np.sum(u_hat, axis=0) - f_hat)
 
-            # 4. 检查收敛（基础版本：简化为固定迭代次数，避免计算量过大）
             if n % 10 == 0:
                 u_diff = np.sum(np.abs(u_hat - u_hat_prev) ** 2) / np.sum(np.abs(u_hat_prev) ** 2)
                 omega_diff = np.sum(np.abs(omega - np.roll(omega, 1))) / self.K
@@ -132,8 +130,9 @@ class VMD(nn.Module):
         imfs = np.zeros((self.K, T))
         for k in range(self.K):
             imfs[k, :] = np.real(np.fft.ifft(np.fft.ifftshift(u_hat[k, :])))
-        # 转换为torch张量并返回
-        return torch.tensor(imfs, device=x.device, dtype=x.dtype)
+        
+        # -------------------------- 修复：用保存的device和dtype创建张量 --------------------------
+        return torch.tensor(imfs, device=device, dtype=dtype)
 
 
 # -------------------------- 新增：VMD周期检测函数 --------------------------
