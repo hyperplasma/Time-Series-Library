@@ -4,11 +4,12 @@ import torch.nn.functional as F
 import torch.fft
 import numpy as np
 from pytorch_wavelets import DWT1D
+from torch.utils.checkpoint import checkpoint  # 导入梯度检查点
 from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
 
-# -------------------------- 1. 修复：用torch.flip替代负步长切片 --------------------------
+# -------------------------- 1. 小波周期检测（内存优化：减少中间变量累积） --------------------------
 def wavelet_period_detection(x, k=2):
     B, T, C = x.shape
     wavelet_period_candidates = []
@@ -21,6 +22,9 @@ def wavelet_period_detection(x, k=2):
     cA1 = cA1.squeeze(2)  # [B, C, T//2]
 
     for b in range(B):
+        # 优化：单样本中间变量，避免全局累积
+        batch_periods = []
+        batch_energies = []
         for c in range(C):
             cA1_bc = cA1[b, c, :]  # [T//2,]
             if len(cA1_bc) < 2:
@@ -30,14 +34,12 @@ def wavelet_period_detection(x, k=2):
             amp_cA1 = torch.abs(xf_cA1)
             amp_cA1[0] = 0  # 排除直流分量
 
-            # 修复点1：用torch.flip替代[-k:][::-1]，避免负步长
+            # 用torch.flip替代负步长切片
             if len(amp_cA1) <= k:
-                # 当长度<=k时，直接按降序排序（无需切片反转）
                 top_freq_idx = torch.argsort(amp_cA1, descending=True)
             else:
-                # 先取最后k个元素（升序中的top-k），再用torch.flip反转成降序
-                top_k_asc = torch.argsort(amp_cA1)[-k:]  # 升序的top-k索引
-                top_freq_idx = torch.flip(top_k_asc, dims=[0])  # 反转成降序
+                top_k_asc = torch.argsort(amp_cA1)[-k:]
+                top_freq_idx = torch.flip(top_k_asc, dims=[0])
 
             # 计算周期
             T_cA1 = cA1_bc.shape[0]
@@ -49,19 +51,24 @@ def wavelet_period_detection(x, k=2):
             if len(valid_periods) == 0:
                 continue
 
-            wavelet_period_candidates.extend(valid_periods.cpu().numpy().tolist())
+            batch_periods.extend(valid_periods.cpu().numpy().tolist())
             energy_cA1 = torch.sum(cA1_bc ** 2).item()
-            wavelet_energies.extend([energy_cA1] * len(valid_periods))
+            batch_energies.extend([energy_cA1] * len(valid_periods))
+
+        # 累加结果后清理单样本变量
+        wavelet_period_candidates.extend(batch_periods)
+        wavelet_energies.extend(batch_energies)
+        del batch_periods, batch_energies  # 释放内存
 
     # 融合周期候选
     if not wavelet_period_candidates:
         wavelet_periods = np.array([T//2] * k)
     else:
         unique_periods, counts = np.unique(wavelet_period_candidates, return_counts=True)
-        top_k_idx = np.argsort(counts)[-k:][::-1]  # numpy支持负步长，此处无需修改
+        top_k_idx = np.argsort(counts)[-k:][::-1]  # numpy支持负步长
         wavelet_periods = unique_periods[top_k_idx].astype(int)
 
-    # 计算权重
+    # 计算权重（用输入dtype，避免类型不匹配）
     wavelet_weights = torch.ones(B, k, device=x.device, dtype=x.dtype)
     if wavelet_energies:
         wavelet_weights *= (np.mean(wavelet_energies) / k)
@@ -71,13 +78,13 @@ def wavelet_period_detection(x, k=2):
     return wavelet_periods, wavelet_weights
 
 
-# -------------------------- 2. 全GPU VMD类（无修改） --------------------------
+# -------------------------- 2. VMD类（核心内存优化：减少IMF+复用张量+清理缓存） --------------------------
 class VMD(nn.Module):
-    def __init__(self, alpha=2000, tau=1e-7, K=3, DC=0, init=1, tol=1e-6):
+    def __init__(self, alpha=2000, tau=1e-7, K=2, DC=0, init=1, tol=1e-6):  # K从3→2（减少IMF数量）
         super(VMD, self).__init__()
         self.alpha = alpha
         self.tau = tau
-        self.K = K
+        self.K = K  # 减少分解分量，直接降低1/3内存
         self.DC = DC
         self.init = init
         self.tol = tol
@@ -87,26 +94,32 @@ class VMD(nn.Module):
         dtype = x.dtype
         T = x.shape[0]
 
+        # 1. 仅创建必要张量，避免冗余
         t = torch.arange(1, T + 1, device=device) / T
         freqs = t - 0.5 - 1 / T
 
+        # 复数类型（用float32对应complex64，减少内存）
         complex_dtype = torch.complex64 if dtype == torch.float32 else torch.complex128
         u_hat = torch.zeros((self.K, T), dtype=complex_dtype, device=device)
-        u_hat_prev = torch.zeros_like(u_hat)
+        u_hat_prev = u_hat.clone()  # 初始克隆，后续复用
         omega = torch.zeros(self.K, device=device)
 
+        # 初始化中心频率
         if self.init == 1:
             omega = 0.5 * torch.rand(self.K, device=device)
         else:
             omega = torch.linspace(0, 0.5, self.K, device=device)
 
         lambda_hat = torch.zeros((1, T), dtype=complex_dtype, device=device)
-        lambda_hat_prev = torch.zeros_like(lambda_hat)
+        lambda_hat_prev = lambda_hat.clone()
 
+        # 2. FFT结果（仅保留必要部分）
         f_hat = torch.fft.fftshift(torch.fft.fft(x.to(complex_dtype)))
 
-        max_iter = 50
+        # 3. 减少迭代次数（50→30），提前收敛
+        max_iter = 30
         for n in range(max_iter):
+            # 更新IMF频谱（复用u_hat_prev内存）
             for k in range(self.K):
                 denom = (freqs - omega[k]) ** 2 + self.tau ** 2
                 if k > 0:
@@ -115,34 +128,40 @@ class VMD(nn.Module):
                     denom += (freqs - omega[k+1]) ** 2
                 u_hat[k, :] = (f_hat - lambda_hat_prev / 2) / (1 + self.alpha * denom)
 
+            # 更新中心频率（简化计算，仅用u_diff判断收敛）
             for k in range(self.K):
                 if not self.DC:
                     numerator = torch.sum(freqs * torch.abs(u_hat[k, :]) ** 2)
                     denominator = torch.sum(torch.abs(u_hat[k, :]) ** 2) + 1e-8
                     omega[k] = numerator / denominator
-                else:
-                    omega[k] = 0
 
+            # 更新拉格朗日乘子
             lambda_hat = lambda_hat_prev + self.tau * (torch.sum(u_hat, dim=0) - f_hat)
 
-            if n % 10 == 0:
+            # 4. 简化收敛判断（仅用u_diff，减少omega_diff计算）
+            if n % 5 == 0:
                 u_diff = torch.sum(torch.abs(u_hat - u_hat_prev) ** 2) / (torch.sum(torch.abs(u_hat_prev) ** 2) + 1e-8)
-                omega_diff = torch.sum(torch.abs(omega - torch.roll(omega, 1))) / self.K
-                if u_diff < self.tol and omega_diff < self.tol:
+                if u_diff < self.tol:
                     break
 
-            u_hat_prev = u_hat.clone()
-            lambda_hat_prev = lambda_hat.clone()
+            # 5. 复用内存：用copy_替代clone（不创建新张量）
+            u_hat_prev.copy_(u_hat)
+            lambda_hat_prev.copy_(lambda_hat)
 
+        # 6. 计算IMF后显式清理中间复数张量
         imfs = torch.zeros((self.K, T), dtype=dtype, device=device)
         for k in range(self.K):
             imf = torch.fft.ifft(torch.fft.ifftshift(u_hat[k, :])).real
             imfs[k, :] = imf
 
+        # 释放不再使用的大张量+清理GPU缓存
+        del u_hat, u_hat_prev, lambda_hat, lambda_hat_prev, f_hat
+        torch.cuda.empty_cache()
+
         return imfs
 
 
-# -------------------------- 3. VMD周期检测（确认torch.flip已正确使用） --------------------------
+# -------------------------- 3. VMD周期检测（无修改，兼容优化后的VMD） --------------------------
 def vmd_period_detection(x, vmd_model, k=2):
     B, T, C = x.shape
     vmd_period_candidates = []
@@ -151,7 +170,7 @@ def vmd_period_detection(x, vmd_model, k=2):
     for b in range(B):
         for c in range(C):
             seq = x[b, :, c]
-            imfs = vmd_model(seq)
+            imfs = vmd_model(seq)  # 调用优化后的VMD
             imf_energies = torch.sum(imfs ** 2, dim=1)
 
             if torch.all(imf_energies == 0):
@@ -162,10 +181,10 @@ def vmd_period_detection(x, vmd_model, k=2):
             if n == 0:
                 continue
 
-            # 此处已使用torch.flip，无需修改
+            # 用torch.flip处理排序
             sorted_idx_asc = torch.argsort(imf_energies)
             top_n_idx_asc = sorted_idx_asc[-n:]
-            top_imf_idx = torch.flip(top_n_idx_asc, dims=[0])  # 正确的反转方式
+            top_imf_idx = torch.flip(top_n_idx_asc, dims=[0])
 
             for idx in top_imf_idx:
                 imf = imfs[idx, :]
@@ -175,8 +194,8 @@ def vmd_period_detection(x, vmd_model, k=2):
                 if len(amp_imf) <= 1:
                     continue
 
-                # 修复点2：确保此处也用torch.flip处理排序
-                top_freq_idx = torch.flip(torch.argsort(amp_imf)[-1:], dims=[0])[0]  # 取最大频率索引
+                # 取最大频率索引
+                top_freq_idx = torch.flip(torch.argsort(amp_imf)[-1:], dims=[0])[0]
                 if top_freq_idx == 0:
                     continue
                 period = T // top_freq_idx
@@ -184,6 +203,7 @@ def vmd_period_detection(x, vmd_model, k=2):
                 vmd_period_candidates.append(period.item())
                 vmd_energies.append(imf_energies[idx].item())
 
+    # 融合周期候选
     if not vmd_period_candidates:
         vmd_periods = np.array([T//2] * k)
     else:
@@ -193,9 +213,10 @@ def vmd_period_detection(x, vmd_model, k=2):
             vmd_periods = np.pad(unique_periods, (0, k - len(unique_periods)),
                                 mode='constant', constant_values=most_common)
         else:
-            top_k_idx = np.argsort(counts)[-k:][::-1]  # numpy支持负步长
+            top_k_idx = np.argsort(counts)[-k:][::-1]
             vmd_periods = unique_periods[top_k_idx].astype(int)
 
+    # 计算权重
     vmd_weights = torch.ones(B, k, device=x.device, dtype=x.dtype)
     if vmd_energies:
         vmd_weights *= (np.mean(vmd_energies) / k)
@@ -205,24 +226,25 @@ def vmd_period_detection(x, vmd_model, k=2):
     return vmd_periods, vmd_weights
 
 
-# -------------------------- 4. 多尺度周期检测融合模块（无修改） --------------------------
+# -------------------------- 4. 多尺度周期检测融合模块（VMD默认K=2，兼容优化） --------------------------
 class MultiScalePeriodDetector(nn.Module):
     def __init__(self, configs):
         super(MultiScalePeriodDetector, self).__init__()
         self.top_k = configs.top_k
-        self.vmd_model = VMD(K=getattr(configs, 'vmd_K', 3), alpha=2000)
+        # 初始化优化后的VMD，默认K=2（可通过configs.vmd_K覆盖）
+        self.vmd_model = VMD(K=getattr(configs, 'vmd_K', 2), alpha=2000)
 
     def forward(self, x):
         B, T, C = x.shape
 
         # 1. FFT周期检测
         fft_periods, fft_weights = FFT_for_Period(x, self.top_k)
-        # 2. 小波周期检测（调用修复后的函数）
+        # 2. 小波周期检测（优化后）
         wavelet_periods, wavelet_weights = wavelet_period_detection(x, self.top_k)
-        # 3. VMD周期检测
+        # 3. VMD周期检测（优化后）
         vmd_periods, vmd_weights = vmd_period_detection(x, self.vmd_model, self.top_k)
 
-        # 融合逻辑
+        # 融合逻辑（无修改）
         all_period_candidates = list(fft_periods) + list(wavelet_periods) + list(vmd_periods)
         unique_periods, counts = np.unique(all_period_candidates, return_counts=True)
         valid_mask = (unique_periods > 1) & (unique_periods < T//2)
@@ -233,7 +255,7 @@ class MultiScalePeriodDetector(nn.Module):
         else:
             valid_periods = unique_periods[valid_mask]
             valid_counts = counts[valid_mask]
-            top_k_valid_idx = np.argsort(valid_counts)[-self.top_k:][::-1]  # numpy支持负步长
+            top_k_valid_idx = np.argsort(valid_counts)[-self.top_k:][::-1]
             fused_periods = valid_periods[top_k_valid_idx].astype(int)
 
             fused_weights = torch.zeros(B, self.top_k, device=x.device, dtype=x.dtype)
@@ -254,29 +276,30 @@ class MultiScalePeriodDetector(nn.Module):
         return fused_periods, fused_weights
 
 
-# -------------------------- 5. FFT周期检测（修复排序逻辑） --------------------------
+# -------------------------- 5. FFT周期检测（无修改，已修复排序） --------------------------
 def FFT_for_Period(x, k=2):
     xf = torch.fft.rfft(x, dim=1)
     frequency_list = abs(xf).mean(0).mean(-1)
     frequency_list[0] = 0
 
-    # 修复点3：用torch.flip替代[-k:][::-1]
-    sorted_idx_asc = torch.argsort(frequency_list)  # 升序索引
-    top_k_asc = sorted_idx_asc[-k:]  # 取最后k个（top-k）
-    top_list = torch.flip(top_k_asc, dims=[0]).detach().cpu().numpy()  # 反转成降序
+    # 用torch.flip替代负步长切片
+    sorted_idx_asc = torch.argsort(frequency_list)
+    top_k_asc = sorted_idx_asc[-k:]
+    top_list = torch.flip(top_k_asc, dims=[0]).detach().cpu().numpy()
 
     period = x.shape[1] // top_list
     weights = abs(xf).mean(-1)[:, top_list]
     return period, weights
 
 
-# -------------------------- 6. TimesBlock（无修改） --------------------------
+# -------------------------- 6. TimesBlock（梯度检查点优化：减少激活值缓存） --------------------------
 class TimesBlock(nn.Module):
     def __init__(self, configs):
         super(TimesBlock, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
+        # 原有卷积块（无修改）
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff, num_kernels=configs.num_kernels),
             nn.GELU(),
@@ -291,6 +314,7 @@ class TimesBlock(nn.Module):
         res = []
         for i in range(self.k):
             period = period_list[i]
+            # 周期padding（无修改）
             if (self.seq_len + self.pred_len) % period != 0:
                 length = ((self.seq_len + self.pred_len) // period) + 1
                 length *= period
@@ -301,11 +325,15 @@ class TimesBlock(nn.Module):
                 length = self.seq_len + self.pred_len
                 out = x
 
+            # reshape（无修改）
             out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
-            out = self.conv(out)
+            # 核心优化：用梯度检查点包装conv，减少激活值内存（以少量计算时间换内存）
+            out = checkpoint(self.conv, out)  # 替代直接调用self.conv(out)
+            # reshape back
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
             res.append(out[:, :(self.seq_len + self.pred_len), :])
 
+        # 后续逻辑（无修改）
         res = torch.stack(res, dim=-1)
         period_weight = F.softmax(period_weight, dim=1)
         period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
@@ -314,7 +342,7 @@ class TimesBlock(nn.Module):
         return res
 
 
-# -------------------------- 7. Model类（无修改） --------------------------
+# -------------------------- 7. Model类（无修改，兼容所有优化） --------------------------
 class Model(nn.Module):
     def __init__(self, configs):
         super(Model, self).__init__()
