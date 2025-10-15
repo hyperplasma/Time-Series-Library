@@ -41,18 +41,18 @@ class VMDPeriodDetection(nn.Module):
 
     def vmd_decomposition(self, signal, K=5, alpha=1000, tau=1e-6, max_iter=50):
         """
-        优化的VMD分解实现
+        优化的VMD分解实现 - 避免in-place操作
         输入: signal [B, T]
         输出: IMFs [B, K, T]
         """
         B, T = signal.shape
         device = signal.device
         
-        # 初始化
-        u = torch.zeros(B, K, T, device=device)  # IMFs
-        u_hat = torch.zeros(B, K, T//2+1, dtype=torch.complex64, device=device)  # 频域IMFs
-        omega = torch.zeros(B, K, device=device)  # 中心频率
-        lambda_hat = torch.zeros(B, T//2+1, dtype=torch.complex64, device=device)  # 拉格朗日乘子
+        # 初始化 - 使用requires_grad=False避免梯度问题
+        u = torch.zeros(B, K, T, device=device, requires_grad=False)  # IMFs
+        u_hat = torch.zeros(B, K, T//2+1, dtype=torch.complex64, device=device, requires_grad=False)  # 频域IMFs
+        omega = torch.zeros(B, K, device=device, requires_grad=False)  # 中心频率
+        lambda_hat = torch.zeros(B, T//2+1, dtype=torch.complex64, device=device, requires_grad=False)  # 拉格朗日乘子
         
         # 信号傅里叶变换
         signal_hat = torch.fft.rfft(signal, dim=1)
@@ -60,11 +60,18 @@ class VMDPeriodDetection(nn.Module):
         # 频率轴
         freqs = torch.fft.rfftfreq(T, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, T//2+1]
         
+        # 避免in-place操作的迭代
         for iter_idx in range(max_iter):
+            # 保存前一次的u_hat用于收敛判断
+            u_hat_prev = u_hat.clone()
+            
             # 更新IMFs的频域表示
             sum_u_hat = u_hat.sum(dim=1, keepdim=True)  # [B, 1, T//2+1]
             
-            # VMD核心更新公式
+            # 创建新的u_hat避免in-place操作
+            u_hat_new = torch.zeros_like(u_hat)
+            
+            # VMD核心更新公式 - 避免in-place操作
             for k in range(K):
                 # 分子部分
                 numerator = signal_hat - sum_u_hat + lambda_hat/2
@@ -73,26 +80,31 @@ class VMDPeriodDetection(nn.Module):
                 # 分母部分: 1 + alpha * (freqs - omega)^2
                 denominator = 1.0 + alpha * (freqs - omega[:, k:k+1].unsqueeze(-1)) ** 2
                 
-                # 更新IMF频域表示
-                u_hat[:, k] = numerator.squeeze(1) / denominator.squeeze(1)
+                # 更新IMF频域表示 - 不使用in-place操作
+                u_hat_new[:, k] = numerator.squeeze(1) / denominator.squeeze(1)
             
-            # 更新中心频率
+            # 更新中心频率 - 避免in-place操作
+            omega_new = torch.zeros_like(omega)
             for k in range(K):
-                power = torch.abs(u_hat[:, k]) ** 2
-                omega_numerator = torch.sum(freqs.squeeze(0).squeeze(0) * power, dim=1)
-                omega_denominator = torch.sum(power, dim=1)
-                omega[:, k] = omega_numerator / (omega_denominator + 1e-10)
+                u_hat_k = u_hat_new[:, k]  # [B, T//2+1, C]
+                power = torch.abs(u_hat_k) ** 2
+                omega_num = torch.sum(freqs.squeeze(0).squeeze(0) * power, dim=1)  # [B, C]
+                omega_den = torch.sum(power, dim=1)  # [B, C]
+                omega_new[:, k] = torch.mean(omega_num / (omega_den + 1e-10), dim=-1)
             
-            # 更新拉格朗日乘子 (对偶上升)
-            lambda_hat += tau * (signal_hat - u_hat.sum(dim=1))
+            # 更新拉格朗日乘子 (对偶上升) - 避免in-place操作
+            lambda_hat_new = lambda_hat + tau * (signal_hat - u_hat_new.sum(dim=1))
+            
+            # 更新变量
+            u_hat = u_hat_new
+            omega = omega_new
+            lambda_hat = lambda_hat_new
             
             # 收敛检查
             if iter_idx > 0:
                 convergence = torch.mean(torch.abs(u_hat - u_hat_prev) ** 2)
                 if convergence < self.tol:
                     break
-            
-            u_hat_prev = u_hat.clone()
         
         # 转换回时域
         for k in range(K):
@@ -111,21 +123,19 @@ class VMDPeriodDetection(nn.Module):
         # 确保k不超过K
         k = min(k, self.K)
         
-        # 对每个通道分别应用VMD，选择信息最丰富的通道
-        all_periods = []
-        all_weights = []
-        
         # 选择方差最大的通道作为代表（通常包含最多信息）
-        channel_var = x.var(dim=1).mean(dim=1)  # [B]
-        representative_channel = channel_var.argmax(dim=0)  # 选择方差最大的批次
+        with torch.no_grad():  # 避免梯度问题
+            channel_var = x.var(dim=1).mean(dim=1)  # [B]
+            representative_channel = channel_var.argmax(dim=0)  # 选择方差最大的批次
         
         # 使用代表性批次进行VMD分解
         rep_signal = x[representative_channel, :, 0]  # [T] 取第一个通道
         rep_signal = rep_signal.unsqueeze(0)  # [1, T]
         
-        # VMD分解
-        imfs = self.vmd_decomposition(rep_signal, K=self.K, alpha=self.alpha, 
-                                    tau=self.tau, max_iter=self.max_iter)  # [1, K, T]
+        # VMD分解 - 使用torch.no_grad()避免梯度计算
+        with torch.no_grad():
+            imfs = self.vmd_decomposition(rep_signal, K=self.K, alpha=self.alpha, 
+                                        tau=self.tau, max_iter=self.max_iter)  # [1, K, T]
         
         # 对每个IMF进行周期检测
         imf_periods = []
@@ -156,7 +166,8 @@ class VMDPeriodDetection(nn.Module):
         if len(selected_periods) < k:
             # 使用原始信号的FFT检测补充周期
             remaining_k = k - len(selected_periods)
-            fft_periods, fft_weights = FFT_for_Period(x[representative_channel:representative_channel+1, :, 0:1], k=remaining_k)
+            with torch.no_grad():  # 避免梯度问题
+                fft_periods, fft_weights = FFT_for_Period(x[representative_channel:representative_channel+1, :, 0:1], k=remaining_k)
             
             # 将FFT检测的周期添加到selected_periods中
             for i in range(len(fft_periods)):
