@@ -73,7 +73,7 @@ class TimesBlock(nn.Module):
 
 class Model(nn.Module):
     """
-    Paper link: https://openreview.net/pdf?id=ju_Uqw384Oq
+    TimesNet with VMD-based period detection
     """
 
     def __init__(self, configs):
