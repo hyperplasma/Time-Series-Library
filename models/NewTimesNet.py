@@ -30,16 +30,16 @@ def FFT_for_Period(x, k=2):
 
 class VMDPeriodDetection(nn.Module):
     """优化版的VMD周期检测，确保性能提升"""
-    def __init__(self, K=3, alpha=1000, tau=1e-6, tol=1e-7, max_iter=50, use_checkpoint=True):
+    def __init__(self, K=5, alpha=1000, tau=1e-6, tol=1e-7, max_iter=50, use_checkpoint=True):
         super(VMDPeriodDetection, self).__init__()
-        self.K = K  # IMF数量
+        self.K = K  # IMF数量，设置为5以匹配top_k
         self.alpha = alpha  # 带宽参数
         self.tau = tau      # 噪声容忍度
         self.tol = tol      # 收敛容忍度
         self.max_iter = max_iter
         self.use_checkpoint = use_checkpoint
 
-    def vmd_decomposition(self, signal, K=3, alpha=1000, tau=1e-6, max_iter=50):
+    def vmd_decomposition(self, signal, K=5, alpha=1000, tau=1e-6, max_iter=50):
         """
         优化的VMD分解实现
         输入: signal [B, T]
@@ -100,13 +100,16 @@ class VMDPeriodDetection(nn.Module):
         
         return u
 
-    def forward(self, x, k=2):
+    def forward(self, x, k=5):
         """
         输入: x [B, T, C]
         输出: period [k], period_weights [B, k]
         """
         B, T, C = x.shape
         device = x.device
+        
+        # 确保k不超过K
+        k = min(k, self.K)
         
         # 对每个通道分别应用VMD，选择信息最丰富的通道
         all_periods = []
@@ -148,7 +151,24 @@ class VMDPeriodDetection(nn.Module):
         
         # 修复：确保所有period都是tensor类型
         selected_periods = torch.stack([imf_periods[i] for i in topk_indices])
-        period_weights = topk_energies.unsqueeze(0).repeat(B, 1)  # [B, k]
+        
+        # 如果周期数量不足k个，用FFT补充
+        if len(selected_periods) < k:
+            # 使用原始信号的FFT检测补充周期
+            remaining_k = k - len(selected_periods)
+            fft_periods, fft_weights = FFT_for_Period(x[representative_channel:representative_channel+1, :, 0:1], k=remaining_k)
+            
+            # 将FFT检测的周期添加到selected_periods中
+            for i in range(len(fft_periods)):
+                period_tensor = torch.tensor(fft_periods[i], device=device) if not torch.is_tensor(fft_periods[i]) else fft_periods[i]
+                selected_periods = torch.cat([selected_periods, period_tensor.unsqueeze(0)])
+            
+            # 扩展权重
+            period_weights = topk_energies.unsqueeze(0).repeat(B, 1)
+            fft_weight_tensor = torch.tensor(fft_weights.mean(dim=1), device=device) if not torch.is_tensor(fft_weights.mean(dim=1)) else fft_weights.mean(dim=1)
+            period_weights = torch.cat([period_weights, fft_weight_tensor.unsqueeze(0).repeat(B, 1)], dim=1)
+        else:
+            period_weights = topk_energies.unsqueeze(0).repeat(B, 1)  # [B, k]
         
         return selected_periods, period_weights
 
@@ -178,6 +198,14 @@ class TimesBlock(nn.Module):
         
         # 使用VMD进行周期检测
         period_list, period_weight = self.period_detector(x, self.k)
+
+        # 确保period_list有足够的元素
+        if len(period_list) < self.k:
+            # 用默认值补充
+            default_periods = torch.tensor([T // 2] * (self.k - len(period_list)), device=x.device)
+            period_list = torch.cat([period_list, default_periods])
+            default_weights = torch.zeros(B, self.k - period_weight.shape[1], device=x.device)
+            period_weight = torch.cat([period_weight, default_weights], dim=1)
 
         res = []
         for i in range(self.k):
