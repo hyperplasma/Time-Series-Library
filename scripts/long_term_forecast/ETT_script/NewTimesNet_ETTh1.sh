@@ -24,7 +24,8 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5 
+  --top_k \
+  --batch_size 8
 
 
 python -u run.py \
@@ -49,7 +50,8 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5
+  --top_k 5 \
+  --batch_size 8
 
 
 python -u run.py \
@@ -74,7 +76,8 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5
+  --top_k 5 \
+  --batch_size 8
 
 
 python -u run.py \
@@ -99,4 +102,5 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5
+  --top_k 5 \
+  --batch_size 8
