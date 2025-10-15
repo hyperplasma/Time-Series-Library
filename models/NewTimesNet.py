@@ -151,22 +151,23 @@ class VMDPeriodDetection(nn.Module):
                 while len(selected_periods) < k:
                     selected_periods.append(T // 2)
                 
-                all_periods.append(torch.tensor(selected_periods[:k], device=device))
+                all_periods.append(torch.tensor(selected_periods[:k], device=device, dtype=torch.float))  # 改为float类型
                 all_weights.append(topk_energies[:k].unsqueeze(0))
             else:
                 # 备用方案
                 default_periods = [T // 2] * k
-                all_periods.append(torch.tensor(default_periods, device=device))
+                all_periods.append(torch.tensor(default_periods, device=device, dtype=torch.float))  # 改为float类型
                 all_weights.append(torch.zeros(1, k, device=device))
         
         if len(all_periods) == 0:
             # 最终备用方案
-            period_list = torch.tensor([T // 2] * k, device=device).unsqueeze(0).repeat(B, 1)
+            period_list = torch.tensor([T // 2] * k, device=device, dtype=torch.float).unsqueeze(0).repeat(B, 1)  # 改为float类型
             period_weight = torch.ones(B, k, device=device) / k
-            return period_list[0], period_weight
+            return period_list[0].long(), period_weight  # 返回时转换为long
         
-        # 合并批次结果
-        period_list = torch.stack(all_periods).mean(dim=0)  # [k]
+        # 合并批次结果 - 修复数据类型问题
+        period_list_float = torch.stack(all_periods).mean(dim=0)  # [k], 现在是float类型
+        period_list = period_list_float.long()  # 转换为整数类型
         period_weight = torch.cat(all_weights, dim=0)  # [B, k]
         
         # 权重归一化
@@ -202,13 +203,15 @@ class TimesBlock(nn.Module):
 
         res = []
         for i in range(self.k):
-            period = int(period_list[i].item() if torch.is_tensor(period_list[i]) else period_list[i])
-            period = max(2, min(period, T))  # 确保周期值合理
+            period = period_list[i]
+            # 确保period是整数且合理
+            period_val = period.item() if torch.is_tensor(period) else period
+            period_val = max(2, min(int(period_val), T))
             
             # padding
             total_length = self.seq_len + self.pred_len
-            if total_length % period != 0:
-                length = (((total_length) // period) + 1) * period
+            if total_length % period_val != 0:
+                length = (((total_length) // period_val) + 1) * period_val
                 padding = torch.zeros([x.shape[0], (length - total_length), x.shape[2]], device=x.device)
                 out = torch.cat([x, padding], dim=1)
             else:
@@ -216,7 +219,7 @@ class TimesBlock(nn.Module):
                 out = x
                 
             # reshape
-            out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
+            out = out.reshape(B, length // period_val, period_val, N).permute(0, 3, 1, 2).contiguous()
             
             # 2D conv
             out = self.conv(out)
