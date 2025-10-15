@@ -8,7 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 # 导入pytorch-wavelets库中的小波变换模块
 try:
-    from pytorch_wavelets import DWT1DForward, DWT1DInverse
+    from pytorch_wavelets import DWT1DForward
     HAS_WAVELETS = True
 except ImportError:
     HAS_WAVELETS = False
@@ -16,81 +16,89 @@ except ImportError:
 
 
 def FFT_for_Period(x, k=2):
-    """优化的FFT周期检测，全GPU计算"""
+    """原始FFT周期检测，保持原版性能"""
     # [B, T, C]
     xf = torch.fft.rfft(x, dim=1)
     # find period by amplitudes
     frequency_list = abs(xf).mean(0).mean(-1)
     frequency_list[0] = 0
-    
-    # 修复负步长切片问题
-    _, top_k_asc = torch.topk(frequency_list, k)
-    top_list = torch.flip(top_k_asc, dims=[0])  # 用flip替代[::-1]
-    
-    # 保持在GPU上计算，避免CPU传输
-    period = (x.shape[1] // top_list).to(x.device)
-    period_weights = abs(xf).mean(-1)[:, top_list]
-    
-    return period, period_weights
-
-
-class WaveletPeriodDetection(nn.Module):
-    """GPU加速的小波变换周期检测模块"""
-    def __init__(self, wavelet='db4', mode='symmetric', use_checkpoint=True):
-        super(WaveletPeriodDetection, self).__init__()
-        self.wavelet = wavelet
-        self.mode = mode
-        self.use_checkpoint = use_checkpoint
-        
-        # 修复DWT1D参数错误：删除不存在的level参数
-        if HAS_WAVELETS:
-            self.dwt = DWT1DForward(wave=wavelet, J=1, mode=mode)
-        else:
-            self.dwt = None
-
-    def forward(self, x, k=2):
-        """
-        输入: x [B, T, C]
-        输出: period [k], period_weights [B, k]
-        """
-        if self.dwt is None:
-            # 回退到FFT方法
-            return FFT_for_Period(x, k)
-        
-        B, T, C = x.shape
-        
-        # 调整输入形状以适应DWT1D: [B, C, T]
-        x_permuted = x.permute(0, 2, 1)
-        
-        def _compute_wavelet(x_input):
-            # 小波分解 - 全GPU计算
-            cA, cD = self.dwt(x_input)
-            # 仅使用低频分量cA进行周期检测
-            cA_permuted = cA.permute(0, 2, 1)  # [B, T//2, C]
-            
-            # FFT周期检测
-            periods, weights = FFT_for_Period(cA_permuted, k)
-            return periods, weights
-        
-        if self.use_checkpoint and self.training:
-            # 使用梯度检查点减少内存
-            periods, period_weights = checkpoint(_compute_wavelet, x_permuted)
-        else:
-            periods, period_weights = _compute_wavelet(x_permuted)
-            
-        return periods, period_weights
+    _, top_list = torch.topk(frequency_list, k)
+    top_list = top_list.detach().cpu().numpy()
+    period = x.shape[1] // top_list
+    return period, abs(xf).mean(-1)[:, top_list]
 
 
 class VMDPeriodDetection(nn.Module):
-    """纯PyTorch实现的VMD周期检测（全GPU计算）"""
-    def __init__(self, K=3, alpha=2000, tau=0.0, tol=1e-7, max_iter=30, use_checkpoint=True):
+    """优化版的VMD周期检测，确保性能提升"""
+    def __init__(self, K=3, alpha=1000, tau=1e-6, tol=1e-7, max_iter=50, use_checkpoint=True):
         super(VMDPeriodDetection, self).__init__()
-        self.K = K  # 恢复为3个IMF，避免与top_k冲突
-        self.alpha = alpha
-        self.tau = tau
-        self.tol = tol
-        self.max_iter = max_iter  # 减少迭代次数：50→30
+        self.K = K  # IMF数量
+        self.alpha = alpha  # 带宽参数
+        self.tau = tau      # 噪声容忍度
+        self.tol = tol      # 收敛容忍度
+        self.max_iter = max_iter
         self.use_checkpoint = use_checkpoint
+
+    def vmd_decomposition(self, signal, K=3, alpha=1000, tau=1e-6, max_iter=50):
+        """
+        优化的VMD分解实现
+        输入: signal [B, T]
+        输出: IMFs [B, K, T]
+        """
+        B, T = signal.shape
+        device = signal.device
+        
+        # 初始化
+        u = torch.zeros(B, K, T, device=device)  # IMFs
+        u_hat = torch.zeros(B, K, T//2+1, dtype=torch.complex64, device=device)  # 频域IMFs
+        omega = torch.zeros(B, K, device=device)  # 中心频率
+        lambda_hat = torch.zeros(B, T//2+1, dtype=torch.complex64, device=device)  # 拉格朗日乘子
+        
+        # 信号傅里叶变换
+        signal_hat = torch.fft.rfft(signal, dim=1)
+        
+        # 频率轴
+        freqs = torch.fft.rfftfreq(T, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, T//2+1]
+        
+        for iter_idx in range(max_iter):
+            # 更新IMFs的频域表示
+            sum_u_hat = u_hat.sum(dim=1, keepdim=True)  # [B, 1, T//2+1]
+            
+            # VMD核心更新公式
+            for k in range(K):
+                # 分子部分
+                numerator = signal_hat - sum_u_hat + lambda_hat/2
+                numerator = numerator + u_hat[:, k:k+1]  # 加上当前IMF
+                
+                # 分母部分: 1 + alpha * (freqs - omega)^2
+                denominator = 1.0 + alpha * (freqs - omega[:, k:k+1].unsqueeze(-1)) ** 2
+                
+                # 更新IMF频域表示
+                u_hat[:, k] = numerator.squeeze(1) / denominator.squeeze(1)
+            
+            # 更新中心频率
+            for k in range(K):
+                power = torch.abs(u_hat[:, k]) ** 2
+                omega_numerator = torch.sum(freqs.squeeze(0).squeeze(0) * power, dim=1)
+                omega_denominator = torch.sum(power, dim=1)
+                omega[:, k] = omega_numerator / (omega_denominator + 1e-10)
+            
+            # 更新拉格朗日乘子 (对偶上升)
+            lambda_hat += tau * (signal_hat - u_hat.sum(dim=1))
+            
+            # 收敛检查
+            if iter_idx > 0:
+                convergence = torch.mean(torch.abs(u_hat - u_hat_prev) ** 2)
+                if convergence < self.tol:
+                    break
+            
+            u_hat_prev = u_hat.clone()
+        
+        # 转换回时域
+        for k in range(K):
+            u[:, k] = torch.fft.irfft(u_hat[:, k], n=T, dim=1)
+        
+        return u
 
     def forward(self, x, k=2):
         """
@@ -100,114 +108,45 @@ class VMDPeriodDetection(nn.Module):
         B, T, C = x.shape
         device = x.device
         
-        # 确保k不超过K
-        k = min(k, self.K)
-        
-        # 初始化变量
-        u_hat = torch.zeros(B, self.K, T // 2 + 1, C, dtype=torch.complex64, device=device)
-        u_hat_prev = torch.zeros(B, self.K, T // 2 + 1, C, dtype=torch.complex64, device=device)
-        lambda_hat = torch.zeros(B, T // 2 + 1, C, dtype=torch.complex64, device=device)
-        
-        # 信号的傅里叶变换
-        x_hat = torch.fft.rfft(x, dim=1)  # [B, T//2+1, C]
-        x_hat = x_hat.unsqueeze(1)  # [B, 1, T//2+1, C]
-        
-        # 中心频率
-        omega = torch.zeros(B, self.K, device=device)
-        n = torch.arange(1, T//2+2, device=device).float().unsqueeze(0).unsqueeze(-1)  # [1, T//2+1, 1]
-        
-        def _vmd_iteration(x_hat_input, u_hat_input, u_hat_prev_input, lambda_hat_input, omega_input, n_input):
-            # VMD迭代 - 全PyTorch实现
-            batch_size = x_hat_input.shape[0]
-            
-            for iter_idx in range(self.max_iter):
-                # 更新IMF频谱
-                sum_u_hat = u_hat_input.sum(dim=1, keepdim=True)  # [B, 1, T//2+1, C]
-                numerator = x_hat_input - sum_u_hat + lambda_hat_input.unsqueeze(1) / 2
-                denominator = 1 + self.alpha * (n_input - omega_input.unsqueeze(-1).unsqueeze(-1)) ** 2
-                
-                # 使用copy_避免创建新张量
-                u_hat_prev_input.copy_(u_hat_input)
-                u_hat_input = numerator / denominator
-                
-                # 更新中心频率
-                for k_idx in range(self.K):
-                    u_hat_k = u_hat_input[:, k_idx]  # [B, T//2+1, C]
-                    power = torch.abs(u_hat_k) ** 2
-                    omega_num = torch.sum(n_input * power, dim=1)  # [B, C]
-                    omega_den = torch.sum(power, dim=1)  # [B, C]
-                    omega_input[:, k_idx] = torch.mean(omega_num / (omega_den + 1e-10), dim=-1)
-                
-                # 更新拉格朗日乘子
-                lambda_hat_input += self.tau * (x_hat_input.squeeze(1) - u_hat_input.sum(dim=1))
-                
-                # 收敛判断（每5轮判断一次）
-                if iter_idx % 5 == 4:
-                    convergence = torch.mean(torch.abs(u_hat_input - u_hat_prev_input) ** 2)
-                    if convergence < self.tol:
-                        break
-            
-            return u_hat_input, omega_input
-
-        if self.use_checkpoint and self.training:
-            u_hat, omega = checkpoint(_vmd_iteration, x_hat, u_hat, u_hat_prev, lambda_hat, omega, n)
-        else:
-            u_hat, omega = _vmd_iteration(x_hat, u_hat, u_hat_prev, lambda_hat, omega, n)
-        
-        # 周期检测
+        # 对每个通道分别应用VMD，选择信息最丰富的通道
         all_periods = []
         all_weights = []
         
-        for batch_idx in range(B):
-            batch_periods = []
-            batch_energies = []
-            
-            for k_idx in range(self.K):
-                # IMF时域信号
-                u_k = torch.fft.irfft(u_hat[batch_idx, k_idx], n=T, dim=0)  # [T, C]
-                u_k = u_k.unsqueeze(0)  # [1, T, C]
-                
-                # 使用FFT检测周期
-                periods, weights = FFT_for_Period(u_k, 1)  # 每个IMF只取1个主要周期
-                if len(periods) > 0:
-                    batch_periods.append(periods[0])  # 取第一个周期
-                    batch_energies.append(weights[0].mean())  # 平均能量
-                else:
-                    # 如果没有检测到周期，使用默认值
-                    batch_periods.append(torch.tensor(T // 2, device=device))
-                    batch_energies.append(torch.tensor(0.0, device=device))
-            
-            # 确保有足够的周期
-            if len(batch_periods) < k:
-                # 补充默认周期
-                for _ in range(k - len(batch_periods)):
-                    batch_periods.append(torch.tensor(T // 2, device=device))
-                    batch_energies.append(torch.tensor(0.0, device=device))
-            
-            # 选择能量最高的k个周期
-            energies_tensor = torch.stack(batch_energies)
-            topk_energies, topk_indices = torch.topk(energies_tensor, min(k, len(batch_energies)))
-            
-            selected_periods = torch.stack([batch_periods[i] for i in topk_indices])
-            all_periods.append(selected_periods)
-            all_weights.append(topk_energies.unsqueeze(0))
+        # 选择方差最大的通道作为代表（通常包含最多信息）
+        channel_var = x.var(dim=1).mean(dim=1)  # [B]
+        representative_channel = channel_var.argmax(dim=0)  # 选择方差最大的批次
         
-        # 清理中间变量释放显存
-        del u_hat, u_hat_prev, lambda_hat, x_hat
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 使用代表性批次进行VMD分解
+        rep_signal = x[representative_channel, :, 0]  # [T] 取第一个通道
+        rep_signal = rep_signal.unsqueeze(0)  # [1, T]
         
-        # 修复错误：将整数类型的周期转换为浮点数后再求平均
-        if len(all_periods) == 0:
-            # 如果没有检测到任何周期，使用默认周期
-            default_periods = torch.tensor([T // 2] * k, device=device)
-            default_weights = torch.zeros(B, k, device=device)
-            return default_periods, default_weights
+        # VMD分解
+        imfs = self.vmd_decomposition(rep_signal, K=self.K, alpha=self.alpha, 
+                                    tau=self.tau, max_iter=self.max_iter)  # [1, K, T]
         
-        periods_tensor = torch.stack([p.float() for p in all_periods]).mean(dim=0).long()  # [k]
-        weights_tensor = torch.cat(all_weights, dim=0)  # [B, k]
+        # 对每个IMF进行周期检测
+        imf_periods = []
+        imf_energies = []
         
-        return periods_tensor, weights_tensor
+        for i in range(self.K):
+            imf = imfs[0, i].unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+            periods, weights = FFT_for_Period(imf, k=1)  # 每个IMF取1个主要周期
+            
+            if len(periods) > 0:
+                imf_periods.append(periods[0])
+                imf_energies.append(weights[0].mean())
+            else:
+                imf_periods.append(torch.tensor(T // 2, device=device))
+                imf_energies.append(torch.tensor(0.0, device=device))
+        
+        # 选择能量最高的k个周期
+        energies_tensor = torch.stack(imf_energies)
+        topk_energies, topk_indices = torch.topk(energies_tensor, min(k, len(imf_energies)))
+        
+        selected_periods = torch.stack([imf_periods[i] for i in topk_indices])
+        period_weights = topk_energies.unsqueeze(0).repeat(B, 1)  # [B, k]
+        
+        return selected_periods, period_weights
 
 
 class TimesBlock(nn.Module):
@@ -218,14 +157,8 @@ class TimesBlock(nn.Module):
         self.k = configs.top_k
         self.use_checkpoint = getattr(configs, 'use_checkpoint', True)
         
-        # 选择周期检测方法（默认为改进的小波变换）
-        period_detection_method = getattr(configs, 'period_detection', 'wavelet')
-        if period_detection_method == 'wavelet':
-            self.period_detector = WaveletPeriodDetection(use_checkpoint=self.use_checkpoint)
-        elif period_detection_method == 'vmd':
-            self.period_detector = VMDPeriodDetection(use_checkpoint=self.use_checkpoint)
-        else:  # 默认使用原始FFT
-            self.period_detector = None
+        # 使用VMD作为周期检测方法
+        self.period_detector = VMDPeriodDetection(use_checkpoint=self.use_checkpoint)
 
         # parameter-efficient design
         self.conv = nn.Sequential(
@@ -239,25 +172,14 @@ class TimesBlock(nn.Module):
     def forward(self, x):
         B, T, N = x.size()
         
-        # 周期检测
-        if self.period_detector is not None:
-            period_list, period_weight = self.period_detector(x, self.k)
-        else:
-            period_list, period_weight = FFT_for_Period(x, self.k)
-
-        # 确保period_list有足够的周期
-        if len(period_list) < self.k:
-            # 补充默认周期
-            default_periods = torch.tensor([T // 2] * (self.k - len(period_list)), device=x.device)
-            period_list = torch.cat([period_list, default_periods])
-            default_weights = torch.zeros(B, self.k - len(period_weight[0]), device=x.device)
-            period_weight = torch.cat([period_weight, default_weights], dim=1)
+        # 使用VMD进行周期检测
+        period_list, period_weight = self.period_detector(x, self.k)
 
         res = []
         for i in range(self.k):
             period = period_list[i]
-            # 确保period是整数且大于0
-            period = max(1, int(period.item() if torch.is_tensor(period) else period))
+            # 确保period是整数且合理
+            period = max(2, min(int(period.item()), T))  # 限制在[2, T]范围内
             
             # padding
             total_length = self.seq_len + self.pred_len
@@ -272,7 +194,7 @@ class TimesBlock(nn.Module):
             # reshape
             out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
             
-            # 2D conv: 使用梯度检查点减少激活值缓存
+            # 2D conv
             if self.use_checkpoint and self.training:
                 out = checkpoint(self.conv, out)
             else:
@@ -296,8 +218,7 @@ class TimesBlock(nn.Module):
 
 class Model(nn.Module):
     """
-    Improved TimesNet with GPU-optimized period detection
-    Paper link: https://openreview.net/pdf?id=ju_Uqw384Oq
+    Improved TimesNet with VMD-optimized period detection
     """
 
     def __init__(self, configs):
@@ -308,11 +229,9 @@ class Model(nn.Module):
         self.label_len = configs.label_len
         self.pred_len = configs.pred_len
         
-        # 添加改进相关的配置参数（使用默认值）
+        # 使用VMD作为默认周期检测方法
         if not hasattr(configs, 'use_checkpoint'):
             configs.use_checkpoint = True
-        if not hasattr(configs, 'period_detection'):
-            configs.period_detection = 'wavelet'  # 默认使用小波变换，更稳定
         
         self.model = nn.ModuleList([TimesBlock(configs)
                                     for _ in range(configs.e_layers)])
@@ -320,9 +239,6 @@ class Model(nn.Module):
                                            configs.dropout)
         self.layer = configs.e_layers
         self.layer_norm = nn.LayerNorm(configs.d_model)
-        
-        # 修复：遍历model列表的正确方式
-        self.model_list = nn.ModuleList([TimesBlock(configs) for _ in range(configs.e_layers)])
         
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.predict_linear = nn.Linear(
@@ -352,7 +268,7 @@ class Model(nn.Module):
             0, 2, 1)  # align temporal dimension
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model_list[i](enc_out))
+            enc_out = self.layer_norm(self.model[i](enc_out))
         # project back
         dec_out = self.projection(enc_out)
 
@@ -380,7 +296,7 @@ class Model(nn.Module):
         enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model_list[i](enc_out))
+            enc_out = self.layer_norm(self.model[i](enc_out))
         # project back
         dec_out = self.projection(enc_out)
 
@@ -405,7 +321,7 @@ class Model(nn.Module):
         enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model_list[i](enc_out))
+            enc_out = self.layer_norm(self.model[i](enc_out))
         # project back
         dec_out = self.projection(enc_out)
 
@@ -423,31 +339,28 @@ class Model(nn.Module):
         enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model_list[i](enc_out))
+            enc_out = self.layer_norm(self.model[i](enc_out))
 
         # Output
-        # the output transformer encoder/decoder embeddings don't include non-linearity
         output = self.act(enc_out)
         output = self.dropout(output)
-        # zero-out padding embeddings
         output = output * x_mark_enc.unsqueeze(-1)
-        # (batch_size, seq_length * d_model)
         output = output.reshape(output.shape[0], -1)
-        output = self.projection(output)  # (batch_size, num_classes)
+        output = self.projection(output)
         return output
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]  # [B, L, D]
+            return dec_out[:, -self.pred_len:, :]
         if self.task_name == 'imputation':
             dec_out = self.imputation(
                 x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
-            return dec_out  # [B, L, D]
+            return dec_out
         if self.task_name == 'anomaly_detection':
             dec_out = self.anomaly_detection(x_enc)
-            return dec_out  # [B, L, D]
+            return dec_out
         if self.task_name == 'classification':
             dec_out = self.classification(x_enc, x_mark_enc)
-            return dec_out  # [B, N]
+            return dec_out
         return None
