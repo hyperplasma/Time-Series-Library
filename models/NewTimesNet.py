@@ -83,9 +83,9 @@ class WaveletPeriodDetection(nn.Module):
 
 class VMDPeriodDetection(nn.Module):
     """纯PyTorch实现的VMD周期检测（全GPU计算）"""
-    def __init__(self, K=2, alpha=2000, tau=0.0, tol=1e-7, max_iter=30, use_checkpoint=True):
+    def __init__(self, K=3, alpha=2000, tau=0.0, tol=1e-7, max_iter=30, use_checkpoint=True):
         super(VMDPeriodDetection, self).__init__()
-        self.K = K  # 减少IMF数量：3→2
+        self.K = K  # 恢复为3个IMF，避免与top_k冲突
         self.alpha = alpha
         self.tau = tau
         self.tol = tol
@@ -99,6 +99,9 @@ class VMDPeriodDetection(nn.Module):
         """
         B, T, C = x.shape
         device = x.device
+        
+        # 确保k不超过K
+        k = min(k, self.K)
         
         # 初始化变量
         u_hat = torch.zeros(B, self.K, T // 2 + 1, C, dtype=torch.complex64, device=device)
@@ -165,9 +168,21 @@ class VMDPeriodDetection(nn.Module):
                 u_k = u_k.unsqueeze(0)  # [1, T, C]
                 
                 # 使用FFT检测周期
-                periods, weights = FFT_for_Period(u_k, k)
-                batch_periods.append(periods[0])  # 取第一个batch
-                batch_energies.append(weights[0].mean())  # 平均能量
+                periods, weights = FFT_for_Period(u_k, 1)  # 每个IMF只取1个主要周期
+                if len(periods) > 0:
+                    batch_periods.append(periods[0])  # 取第一个周期
+                    batch_energies.append(weights[0].mean())  # 平均能量
+                else:
+                    # 如果没有检测到周期，使用默认值
+                    batch_periods.append(torch.tensor(T // 2, device=device))
+                    batch_energies.append(torch.tensor(0.0, device=device))
+            
+            # 确保有足够的周期
+            if len(batch_periods) < k:
+                # 补充默认周期
+                for _ in range(k - len(batch_periods)):
+                    batch_periods.append(torch.tensor(T // 2, device=device))
+                    batch_energies.append(torch.tensor(0.0, device=device))
             
             # 选择能量最高的k个周期
             energies_tensor = torch.stack(batch_energies)
@@ -183,6 +198,12 @@ class VMDPeriodDetection(nn.Module):
             torch.cuda.empty_cache()
         
         # 修复错误：将整数类型的周期转换为浮点数后再求平均
+        if len(all_periods) == 0:
+            # 如果没有检测到任何周期，使用默认周期
+            default_periods = torch.tensor([T // 2] * k, device=device)
+            default_weights = torch.zeros(B, k, device=device)
+            return default_periods, default_weights
+        
         periods_tensor = torch.stack([p.float() for p in all_periods]).mean(dim=0).long()  # [k]
         weights_tensor = torch.cat(all_weights, dim=0)  # [B, k]
         
@@ -198,7 +219,7 @@ class TimesBlock(nn.Module):
         self.use_checkpoint = getattr(configs, 'use_checkpoint', True)
         
         # 选择周期检测方法（默认为改进的小波变换）
-        period_detection_method = getattr(configs, 'period_detection', 'vmd')  # 默认使用VMD
+        period_detection_method = getattr(configs, 'period_detection', 'wavelet')
         if period_detection_method == 'wavelet':
             self.period_detector = WaveletPeriodDetection(use_checkpoint=self.use_checkpoint)
         elif period_detection_method == 'vmd':
@@ -224,19 +245,28 @@ class TimesBlock(nn.Module):
         else:
             period_list, period_weight = FFT_for_Period(x, self.k)
 
+        # 确保period_list有足够的周期
+        if len(period_list) < self.k:
+            # 补充默认周期
+            default_periods = torch.tensor([T // 2] * (self.k - len(period_list)), device=x.device)
+            period_list = torch.cat([period_list, default_periods])
+            default_weights = torch.zeros(B, self.k - len(period_weight[0]), device=x.device)
+            period_weight = torch.cat([period_weight, default_weights], dim=1)
+
         res = []
         for i in range(self.k):
             period = period_list[i]
-            # 确保period是整数
-            period = int(period.item() if torch.is_tensor(period) else period)
+            # 确保period是整数且大于0
+            period = max(1, int(period.item() if torch.is_tensor(period) else period))
             
             # padding
-            if (self.seq_len + self.pred_len) % period != 0:
-                length = (((self.seq_len + self.pred_len) // period) + 1) * period
-                padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
+            total_length = self.seq_len + self.pred_len
+            if total_length % period != 0:
+                length = (((total_length) // period) + 1) * period
+                padding = torch.zeros([x.shape[0], (length - total_length), x.shape[2]], device=x.device)
                 out = torch.cat([x, padding], dim=1)
             else:
-                length = (self.seq_len + self.pred_len)
+                length = total_length
                 out = x
                 
             # reshape
@@ -267,7 +297,7 @@ class TimesBlock(nn.Module):
 class Model(nn.Module):
     """
     Improved TimesNet with GPU-optimized period detection
-    OG TimesNet Paper link: https://openreview.net/pdf?id=ju_Uqw384Oq
+    Paper link: https://openreview.net/pdf?id=ju_Uqw384Oq
     """
 
     def __init__(self, configs):
@@ -282,7 +312,7 @@ class Model(nn.Module):
         if not hasattr(configs, 'use_checkpoint'):
             configs.use_checkpoint = True
         if not hasattr(configs, 'period_detection'):
-            configs.period_detection = 'vmd'  # 'wavelet', 'vmd', or 'fft'
+            configs.period_detection = 'wavelet'  # 默认使用小波变换，更稳定
         
         self.model = nn.ModuleList([TimesBlock(configs)
                                     for _ in range(configs.e_layers)])
@@ -290,6 +320,9 @@ class Model(nn.Module):
                                            configs.dropout)
         self.layer = configs.e_layers
         self.layer_norm = nn.LayerNorm(configs.d_model)
+        
+        # 修复：遍历model列表的正确方式
+        self.model_list = nn.ModuleList([TimesBlock(configs) for _ in range(configs.e_layers)])
         
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.predict_linear = nn.Linear(
@@ -319,7 +352,7 @@ class Model(nn.Module):
             0, 2, 1)  # align temporal dimension
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
+            enc_out = self.layer_norm(self.model_list[i](enc_out))
         # project back
         dec_out = self.projection(enc_out)
 
@@ -347,7 +380,7 @@ class Model(nn.Module):
         enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
+            enc_out = self.layer_norm(self.model_list[i](enc_out))
         # project back
         dec_out = self.projection(enc_out)
 
@@ -372,7 +405,7 @@ class Model(nn.Module):
         enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
+            enc_out = self.layer_norm(self.model_list[i](enc_out))
         # project back
         dec_out = self.projection(enc_out)
 
@@ -390,7 +423,7 @@ class Model(nn.Module):
         enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
         # TimesNet
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
+            enc_out = self.layer_norm(self.model_list[i](enc_out))
 
         # Output
         # the output transformer encoder/decoder embeddings don't include non-linearity
