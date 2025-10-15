@@ -133,8 +133,11 @@ class VMDPeriodDetection(nn.Module):
             periods, weights = FFT_for_Period(imf, k=1)  # 每个IMF取1个主要周期
             
             if len(periods) > 0:
-                imf_periods.append(periods[0])
-                imf_energies.append(weights[0].mean())
+                # 确保periods是tensor类型
+                period_tensor = torch.tensor(periods[0], device=device) if not torch.is_tensor(periods[0]) else periods[0]
+                imf_periods.append(period_tensor)
+                energy_tensor = torch.tensor(weights[0].mean(), device=device) if not torch.is_tensor(weights[0].mean()) else weights[0].mean()
+                imf_energies.append(energy_tensor)
             else:
                 imf_periods.append(torch.tensor(T // 2, device=device))
                 imf_energies.append(torch.tensor(0.0, device=device))
@@ -143,6 +146,7 @@ class VMDPeriodDetection(nn.Module):
         energies_tensor = torch.stack(imf_energies)
         topk_energies, topk_indices = torch.topk(energies_tensor, min(k, len(imf_energies)))
         
+        # 修复：确保所有period都是tensor类型
         selected_periods = torch.stack([imf_periods[i] for i in topk_indices])
         period_weights = topk_energies.unsqueeze(0).repeat(B, 1)  # [B, k]
         
@@ -179,12 +183,13 @@ class TimesBlock(nn.Module):
         for i in range(self.k):
             period = period_list[i]
             # 确保period是整数且合理
-            period = max(2, min(int(period.item()), T))  # 限制在[2, T]范围内
+            period_val = period.item() if torch.is_tensor(period) else period
+            period_val = max(2, min(int(period_val), T))  # 限制在[2, T]范围内
             
             # padding
             total_length = self.seq_len + self.pred_len
-            if total_length % period != 0:
-                length = (((total_length) // period) + 1) * period
+            if total_length % period_val != 0:
+                length = (((total_length) // period_val) + 1) * period_val
                 padding = torch.zeros([x.shape[0], (length - total_length), x.shape[2]], device=x.device)
                 out = torch.cat([x, padding], dim=1)
             else:
@@ -192,7 +197,7 @@ class TimesBlock(nn.Module):
                 out = x
                 
             # reshape
-            out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
+            out = out.reshape(B, length // period_val, period_val, N).permute(0, 3, 1, 2).contiguous()
             
             # 2D conv
             if self.use_checkpoint and self.training:
