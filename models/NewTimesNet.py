@@ -182,7 +182,8 @@ class VMDPeriodDetection(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        periods_tensor = torch.stack(all_periods).mean(dim=0)  # [k]
+        # 修复错误：将整数类型的周期转换为浮点数后再求平均
+        periods_tensor = torch.stack([p.float() for p in all_periods]).mean(dim=0).long()  # [k]
         weights_tensor = torch.cat(all_weights, dim=0)  # [B, k]
         
         return periods_tensor, weights_tensor
@@ -197,7 +198,7 @@ class TimesBlock(nn.Module):
         self.use_checkpoint = getattr(configs, 'use_checkpoint', True)
         
         # 选择周期检测方法（默认为改进的小波变换）
-        period_detection_method = getattr(configs, 'period_detection', 'wavelet')
+        period_detection_method = getattr(configs, 'period_detection', 'vmd')  # 默认使用VMD
         if period_detection_method == 'wavelet':
             self.period_detector = WaveletPeriodDetection(use_checkpoint=self.use_checkpoint)
         elif period_detection_method == 'vmd':
