@@ -24,7 +24,7 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k \
+  --top_k 5 \
   --batch_size 8
 
 
