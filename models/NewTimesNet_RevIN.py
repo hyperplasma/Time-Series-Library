@@ -20,6 +20,8 @@ def FFT_for_Period(x, k=2):
 class RevIN(nn.Module):
     """
     Reversible Instance Normalization
+    论文: "Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift"
+    已被PatchTST、DLinear等多个SOTA模型验证有效
     """
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -65,37 +67,6 @@ class RevIN(nn.Module):
         return x
 
 
-class AdaptiveFreqFilter(nn.Module):
-    """
-    自适应频率滤波模块
-    核心思想：在频域自适应学习每个频率分量的重要性，抑制高频噪声
-    """
-    def __init__(self, seq_len, channels):
-        super(AdaptiveFreqFilter, self).__init__()
-        self.seq_len = seq_len
-        self.channels = channels
-        # 可学习的频率权重（针对每个通道）
-        freq_dim = seq_len // 2 + 1
-        self.freq_weight = nn.Parameter(torch.ones(1, freq_dim, channels))
-        self.freq_bias = nn.Parameter(torch.zeros(1, freq_dim, channels))
-        
-    def forward(self, x):
-        # x: [B, T, C]
-        B, T, C = x.shape
-        
-        # FFT到频域
-        x_freq = torch.fft.rfft(x, dim=1)  # [B, T//2+1, C]
-        
-        # 自适应加权
-        weight = torch.sigmoid(self.freq_weight + self.freq_bias)  # [1, T//2+1, C]
-        x_freq_filtered = x_freq * weight
-        
-        # 逆FFT回时域
-        x_filtered = torch.fft.irfft(x_freq_filtered, n=T, dim=1)  # [B, T, C]
-        
-        return x_filtered
-
-
 class TimesBlock(nn.Module):
     def __init__(self, configs):
         super(TimesBlock, self).__init__()
@@ -103,7 +74,6 @@ class TimesBlock(nn.Module):
         self.pred_len = configs.pred_len
         self.k = configs.top_k
         
-        # 原有卷积模块
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff,
                                num_kernels=configs.num_kernels),
@@ -111,15 +81,6 @@ class TimesBlock(nn.Module):
             Inception_Block_V1(configs.d_ff, configs.d_model,
                                num_kernels=configs.num_kernels)
         )
-        
-        # 新增：自适应频率滤波
-        self.freq_filter = AdaptiveFreqFilter(
-            seq_len=configs.seq_len + configs.pred_len, 
-            channels=configs.d_model
-        )
-        
-        # 新增：可学习的残差缩放因子
-        self.residual_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x):
         B, T, N = x.size()
@@ -135,29 +96,22 @@ class TimesBlock(nn.Module):
             else:
                 length = (self.seq_len + self.pred_len)
                 out = x
-            
             out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
             out = self.conv(out)
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
             res.append(out[:, :(self.seq_len + self.pred_len), :])
-        
         res = torch.stack(res, dim=-1)
         period_weight = F.softmax(period_weight, dim=1)
         period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
         res = torch.sum(res * period_weight, -1)
-        
-        # 新增：频率滤波
-        res = self.freq_filter(res)
-        
-        # 新增：可学习残差缩放
-        res = res + self.residual_scale * x
-        
+        res = res + x
         return res
 
 
 class Model(nn.Module):
     """
-    TimesNet + RevIN + Adaptive Frequency Filtering
+    TimesNet + RevIN
+    核心改进：使用RevIN替代原版标准化，已被多个SOTA模型验证有效
     """
 
     def __init__(self, configs):
@@ -168,6 +122,7 @@ class Model(nn.Module):
         self.label_len = configs.label_len
         self.pred_len = configs.pred_len
         
+        # RevIN: 关键改进点
         self.use_revin = getattr(configs, 'use_revin', True)
         if self.use_revin:
             self.revin_layer = RevIN(configs.enc_in, affine=True)
