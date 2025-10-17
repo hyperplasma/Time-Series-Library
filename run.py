@@ -139,6 +139,9 @@ if __name__ == '__main__':
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
+    
+    # NewTimesNet
+    parser.add_argument('--use_revin', type=int, default=1, help='whether to use RevIN')
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:
