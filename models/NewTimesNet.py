@@ -94,7 +94,7 @@ class TimesBlock(nn.Module):
         self.pred_len = configs.pred_len
         self.k = configs.top_k
         # 小波包开关（默认关闭，兼容原版）
-        self.use_wpt = False  # True启用WPT，False用原版FFT
+        self.use_wpt = True  # True启用WPT，False用原版FFT
         self.wpt_level = 2  # 固定2级分解，无需修改
         # parameter-efficient design
         self.conv = nn.Sequential(
