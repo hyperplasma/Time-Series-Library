@@ -20,40 +20,39 @@ def FFT_for_Period(x, k=2):
 
 
 def WPT_for_Period(x, k=2, level=2, wave='db4'):
-    # 核心修复：正确处理DWT1D的返回格式（低频分量 + 高频分量列表）
+    # 核心修复：确保输入DWT1D的张量是3维（N, C, L），删除冗余维度
     B, T, C = x.shape
     device = x.device
     dwt = DWT1D(wave=wave, mode='symmetric').to(device)
-    x_reshaped = x.permute(0, 2, 1)  # [B, C, T]
+    # 第1级分解输入：[B, C, T]（3维，符合要求）
+    x_reshaped = x.permute(0, 2, 1)  # [B, C, T] → 3维
+    
+    # 第1级分解：返回 (cA1, [cD1])，均为3维
+    cA1, cD1_list = dwt(x_reshaped)  # cA1: [B, C, T//2]；cD1_list[0]: [B, C, T//2]
+    cA1 = cA1.squeeze(2)  # 移除可能的冗余维度（确保3维）
+    cD1 = cD1_list[0].squeeze(2)  # 3维：[B, C, T//2]
 
-    # 第1级分解：返回 (cA1, [cD1]) → 高频分量是列表，需取第0个元素
-    cA1, cD1_list = dwt(x_reshaped)  # cA1: [B, C, 1, T//2]; cD1_list: [tensor([B,C,1,T//2])]
-    cA1 = cA1.squeeze(2)  # 移除冗余维度 → [B, C, T//2]
-    cD1 = cD1_list[0].squeeze(2)  # 从列表取出cD1张量，再移除维度 → [B, C, T//2]
+    # 第2级分解cA1：直接用3维张量输入（无需补维度）
+    cA2, cD2_list = dwt(cA1)  # cA1是3维[B, C, T//2]，符合输入要求
+    cA2 = cA2.squeeze(2)  # [B, C, T//4]（3维）
+    cD2 = cD2_list[0].squeeze(2)  # [B, C, T//4]（3维）
 
-    # 第2级分解：对cA1分解 → 返回 (cA2, [cD2])
-    cA1_unsqueeze = cA1.unsqueeze(2)  # 补回通道维度（DWT1D要求输入[B,C,1,L]）
-    cA2, cD2_list = dwt(cA1_unsqueeze)
-    cA2 = cA2.squeeze(2)  # [B, C, T//4]
-    cD2 = cD2_list[0].squeeze(2)  # [B, C, T//4]
+    # 第2级分解cD1：同样直接用3维张量输入
+    cA1D1, cD1D1_list = dwt(cD1)  # cD1是3维[B, C, T//2]，符合要求
+    cA1D1 = cA1D1.squeeze(2)  # [B, C, T//4]（3维）
+    cD1D1 = cD1D1_list[0].squeeze(2)  # [B, C, T//4]（3维）
 
-    # 第2级分解：对cD1分解 → 返回 (cA1D1, [cD1D1])
-    cD1_unsqueeze = cD1.unsqueeze(2)
-    cA1D1, cD1D1_list = dwt(cD1_unsqueeze)
-    cA1D1 = cA1D1.squeeze(2)  # [B, C, T//4]
-    cD1D1 = cD1D1_list[0].squeeze(2)  # [B, C, T//4]
-
-    # 4个子带（与原逻辑一致）
+    # 4个子带（均为3维）
     subbands = [cA2, cD2, cA1D1, cD1D1]
     all_periods = []
     all_amps = []
 
     for subband in subbands:
-        T_sub = subband.shape[2]
-        xf_sub = torch.fft.rfft(subband, dim=2)
-        amp_sub = abs(xf_sub).mean(1)  # [B, F]
-        freq_list_sub = amp_sub.mean(0)
-        freq_list_sub[0] = 0
+        T_sub = subband.shape[2]  # 子带长度
+        xf_sub = torch.fft.rfft(subband, dim=2)  # 在时间维度（dim=2）做FFT
+        amp_sub = abs(xf_sub).mean(1)  # [B, F]（按通道平均）
+        freq_list_sub = amp_sub.mean(0)  # [F]（按样本平均）
+        freq_list_sub[0] = 0  # 排除直流分量
 
         # 取top-k频率
         if len(freq_list_sub) <= k:
@@ -61,11 +60,11 @@ def WPT_for_Period(x, k=2, level=2, wave='db4'):
         else:
             _, top_list_sub = torch.topk(freq_list_sub, k)
 
-        # 计算周期并收集
+        # 计算周期（映射回原始长度）
         periods_sub = (T_sub // top_list_sub) * (2 ** level)
         all_periods.extend(periods_sub.cpu().numpy().tolist())
-        # 收集振幅
-        sub_amps = amp_sub[:, top_list_sub]
+        # 收集振幅（用于权重）
+        sub_amps = amp_sub[:, top_list_sub]  # [B, k]
         all_amps.append(sub_amps)
 
     # 融合周期（原逻辑不变）
@@ -79,8 +78,8 @@ def WPT_for_Period(x, k=2, level=2, wave='db4'):
     top_periods = unique_periods[top_k_idx].int().cpu().numpy()
 
     # 计算权重（原逻辑不变）
-    all_amps = torch.cat(all_amps, dim=1)
-    period_weights = all_amps.mean(dim=1, keepdim=True).repeat(1, k)
+    all_amps = torch.cat(all_amps, dim=1)  # [B, 4k]
+    period_weights = all_amps.mean(dim=1, keepdim=True).repeat(1, k)  # [B, k]
 
     return top_periods, period_weights
 
@@ -91,8 +90,7 @@ class TimesBlock(nn.Module):
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
-        # 已开启WPT（无需修改）
-        self.use_wpt = True  # 现在默认开启，符合你的需求
+        self.use_wpt = True  # 已开启WPT
         self.wpt_level = 2
         # parameter-efficient design
         self.conv = nn.Sequential(
@@ -105,7 +103,6 @@ class TimesBlock(nn.Module):
 
     def forward(self, x):
         B, T, N = x.size()
-        # 调用修正后的WPT函数（无修改）
         if self.use_wpt:
             period_list, period_weight = WPT_for_Period(x, self.k, self.wpt_level)
         else:
