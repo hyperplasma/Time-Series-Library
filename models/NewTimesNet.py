@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
+from pytorch_wavelets import WaveletPacket1D  # 引入小波包变换库
 from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
@@ -18,12 +19,65 @@ def FFT_for_Period(x, k=2):
     return period, abs(xf).mean(-1)[:, top_list]
 
 
+def WPT_for_Period(x, k=2, level=2, wave='db4'):
+    # 小波包变换提取多尺度周期 [B, T, C] -> 周期列表 + 权重
+    B, T, C = x.shape
+    device = x.device
+    wp = WaveletPacket1D(wave=wave, mode='symmetric', level=level).to(device)  # 2级分解
+    
+    # 调整输入形状为 [B, C, T]（适配小波包接口）
+    x_reshaped = x.permute(0, 2, 1)  # [B, C, T]
+    wp_out = wp(x_reshaped)  # 小波包分解结果
+    
+    # 2级分解的4个子带（'aa'低频-低频, 'ad'低频-高频, 'da'高频-低频, 'dd'高频-高频）
+    subband_keys = ['aa', 'ad', 'da', 'dd']
+    all_periods = []
+    all_amps = []
+    
+    for key in subband_keys:
+        subband = wp_out[key]  # 子带形状 [B, C, T//(2^level), 1]
+        subband = subband.squeeze(-1)  # 去除冗余维度 [B, C, T_sub]
+        T_sub = subband.shape[2]
+        
+        # 对每个子带做FFT提取周期
+        xf_sub = torch.fft.rfft(subband, dim=2)  # [B, C, F]
+        amp_sub = abs(xf_sub).mean(1)  # 按通道平均振幅 [B, F]
+        freq_list_sub = amp_sub.mean(0)  # 按样本平均 [F]
+        freq_list_sub[0] = 0  # 排除直流分量
+        
+        # 取子带内top-k频率
+        _, top_list_sub = torch.topk(freq_list_sub, k)
+        top_list_sub = top_list_sub.detach()
+        
+        # 映射回原始序列长度的周期（子带周期 × 2^level）
+        periods_sub = (T_sub // top_list_sub) * (2 ** level)
+        all_periods.extend(periods_sub.cpu().numpy().tolist())
+        
+        # 记录对应振幅（用于计算权重）
+        sub_amps = amp_sub[:, top_list_sub]  # [B, k]
+        all_amps.append(sub_amps)
+    
+    # 融合所有子带的周期（取出现频次最高的top-k）
+    unique_periods, counts = torch.unique(torch.tensor(all_periods), return_counts=True)
+    _, top_k_idx = torch.topk(counts, min(k, len(unique_periods)))
+    top_periods = unique_periods[top_k_idx].int().cpu().numpy()
+    
+    # 计算周期权重（子带振幅平均）
+    all_amps = torch.cat(all_amps, dim=1)  # [B, 4k]
+    period_weights = all_amps.mean(dim=1, keepdim=True).repeat(1, k)  # [B, k]
+    
+    return top_periods, period_weights
+
+
 class TimesBlock(nn.Module):
     def __init__(self, configs):
         super(TimesBlock, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
+        # 新增小波包变换控制参数（默认关闭，便于消融实验）
+        self.use_wpt = False  # True: 使用WPT, False: 使用原版FFT
+        self.wpt_level = 2  # 小波包分解级别（默认2级）
         # parameter-efficient design
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff,
@@ -35,7 +89,11 @@ class TimesBlock(nn.Module):
 
     def forward(self, x):
         B, T, N = x.size()
-        period_list, period_weight = FFT_for_Period(x, self.k)
+        # 选择周期检测方式（模块化切换，便于消融）
+        if self.use_wpt:
+            period_list, period_weight = WPT_for_Period(x, self.k, self.wpt_level)
+        else:
+            period_list, period_weight = FFT_for_Period(x, self.k)
 
         res = []
         for i in range(self.k):
