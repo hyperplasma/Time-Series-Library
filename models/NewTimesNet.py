@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
-from pytorch_wavelets import DWT1D
+import pywt  # 改用pywt库（更成熟的小波包实现）
 from layers.Embed import DataEmbedding
 from layers.Conv_Blocks import Inception_Block_V1
 
@@ -10,7 +10,6 @@ from layers.Conv_Blocks import Inception_Block_V1
 def FFT_for_Period(x, k=2):
     # [B, T, C]
     xf = torch.fft.rfft(x, dim=1)
-    # find period by amplitudes
     frequency_list = abs(xf).mean(0).mean(-1)
     frequency_list[0] = 0
     _, top_list = torch.topk(frequency_list, k)
@@ -20,66 +19,92 @@ def FFT_for_Period(x, k=2):
 
 
 def WPT_for_Period(x, k=2, level=2, wave='db4'):
-    # 核心修复：确保输入DWT1D的张量是3维（N, C, L），删除冗余维度
-    B, T, C = x.shape
+    """
+    参考pywt官方小波包示例 + 信号处理中周期提取的标准流程
+    1. 小波包分解 → 2. 子带能量计算 → 3. 筛选高能量子带 → 4. 提取周期并校验 → 5. 能量加权融合
+    """
+    B, T, C = x.shape  # [批大小, 序列长度, 特征数]
     device = x.device
-    dwt = DWT1D(wave=wave, mode='symmetric').to(device)
-    # 第1级分解输入：[B, C, T]（3维，符合要求）
-    x_reshaped = x.permute(0, 2, 1)  # [B, C, T] → 3维
-    
-    # 第1级分解：返回 (cA1, [cD1])，均为3维
-    cA1, cD1_list = dwt(x_reshaped)  # cA1: [B, C, T//2]；cD1_list[0]: [B, C, T//2]
-    cA1 = cA1.squeeze(2)  # 移除可能的冗余维度（确保3维）
-    cD1 = cD1_list[0].squeeze(2)  # 3维：[B, C, T//2]
-
-    # 第2级分解cA1：直接用3维张量输入（无需补维度）
-    cA2, cD2_list = dwt(cA1)  # cA1是3维[B, C, T//2]，符合输入要求
-    cA2 = cA2.squeeze(2)  # [B, C, T//4]（3维）
-    cD2 = cD2_list[0].squeeze(2)  # [B, C, T//4]（3维）
-
-    # 第2级分解cD1：同样直接用3维张量输入
-    cA1D1, cD1D1_list = dwt(cD1)  # cD1是3维[B, C, T//2]，符合要求
-    cA1D1 = cA1D1.squeeze(2)  # [B, C, T//4]（3维）
-    cD1D1 = cD1D1_list[0].squeeze(2)  # [B, C, T//4]（3维）
-
-    # 4个子带（均为3维）
-    subbands = [cA2, cD2, cA1D1, cD1D1]
+    x_np = x.detach().cpu().numpy()  # 转为numpy（pywt更适配numpy）
     all_periods = []
-    all_amps = []
+    all_energies = []  # 用能量作为权重（替代振幅）
 
-    for subband in subbands:
-        T_sub = subband.shape[2]  # 子带长度
-        xf_sub = torch.fft.rfft(subband, dim=2)  # 在时间维度（dim=2）做FFT
-        amp_sub = abs(xf_sub).mean(1)  # [B, F]（按通道平均）
-        freq_list_sub = amp_sub.mean(0)  # [F]（按样本平均）
-        freq_list_sub[0] = 0  # 排除直流分量
+    # 遍历每个样本（确保批量处理正确性）
+    for b in range(B):
+        sample = x_np[b]  # [T, C]
+        # 对每个特征通道单独处理（避免跨通道干扰）
+        for c in range(C):
+            seq = sample[:, c]  # [T]，单特征序列
 
-        # 取top-k频率
-        if len(freq_list_sub) <= k:
-            top_list_sub = torch.argsort(freq_list_sub, descending=True)
-        else:
-            _, top_list_sub = torch.topk(freq_list_sub, k)
+            # 1. 小波包分解（pywt标准实现）
+            wp = pywt.WaveletPacket(data=seq, wavelet=wave, mode='symmetric', maxlevel=level)
+            # 获取所有子带节点（如2级分解：['aa', 'ad', 'da', 'dd']）
+            nodes = [node.path for node in wp.get_level(level, 'natural')]
 
-        # 计算周期（映射回原始长度）
-        periods_sub = (T_sub // top_list_sub) * (2 ** level)
-        all_periods.extend(periods_sub.cpu().numpy().tolist())
-        # 收集振幅（用于权重）
-        sub_amps = amp_sub[:, top_list_sub]  # [B, k]
-        all_amps.append(sub_amps)
+            # 2. 计算每个子带的能量（能量高的子带包含更多有效信息）
+            subband_energies = {}
+            subband_data = {}
+            for node in nodes:
+                data = wp[node].data  # 子带数据
+                energy = torch.sum(torch.tensor(data)**2).item()  # 能量=平方和
+                subband_energies[node] = energy
+                subband_data[node] = data
 
-    # 融合周期（原逻辑不变）
-    unique_periods, counts = torch.unique(torch.tensor(all_periods), return_counts=True)
-    if len(unique_periods) < k:
-        pad_num = k - len(unique_periods)
-        pad_periods = torch.tensor([T//2]*pad_num, device=unique_periods.device)
-        unique_periods = torch.cat([unique_periods, pad_periods])
-        counts = torch.cat([counts, torch.ones(pad_num, device=counts.device)])
-    _, top_k_idx = torch.topk(counts, k)
-    top_periods = unique_periods[top_k_idx].int().cpu().numpy()
+            # 3. 筛选高能量子带（保留能量前50%的子带，过滤噪声）
+            sorted_nodes = sorted(subband_energies.items(), key=lambda x: x[1], reverse=True)
+            keep_num = max(1, len(sorted_nodes) // 2)  # 至少保留1个子带
+            valid_nodes = [node for node, _ in sorted_nodes[:keep_num]]
 
-    # 计算权重（原逻辑不变）
-    all_amps = torch.cat(all_amps, dim=1)  # [B, 4k]
-    period_weights = all_amps.mean(dim=1, keepdim=True).repeat(1, k)  # [B, k]
+            # 4. 从有效子带提取周期
+            for node in valid_nodes:
+                data = subband_data[node]
+                T_sub = len(data)
+                if T_sub < 4:  # 子带长度过短，跳过
+                    continue
+
+                # 子带FFT
+                xf_sub = torch.fft.rfft(torch.tensor(data))
+                amp_sub = abs(xf_sub)
+                amp_sub[0] = 0  # 排除直流分量
+                freq_list_sub = amp_sub.numpy()
+
+                # 取top-k频率
+                top_idx = np.argsort(freq_list_sub)[-k:][::-1]
+                top_freq = top_idx
+
+                # 计算周期并映射回原始长度
+                periods_sub = (T_sub // top_freq) * (2 ** level) if T_sub > 0 else []
+                # 周期合理性校验（针对ETTh1：保留24±5、168±20等合理周期）
+                valid_periods = []
+                for p in periods_sub:
+                    if (19 <= p <= 29) or (148 <= p <= 188) or (p > 2 and p <= T):
+                        valid_periods.append(p)
+                if not valid_periods:  # 无有效周期时用子带主导周期
+                    valid_periods = [T_sub // top_freq[0] * (2**level)] if len(top_freq) > 0 else [T//2]
+
+                # 收集周期和对应子带能量（能量作为权重）
+                all_periods.extend(valid_periods)
+                all_energies.extend([subband_energies[node]] * len(valid_periods))
+
+    # 5. 按能量加权融合周期（能量高的周期权重更高）
+    if not all_periods:  # 极端情况兜底
+        return np.array([T//2]*k), torch.ones(B, k, device=device)
+
+    # 统计周期频次，结合能量加权
+    unique_periods, counts = np.unique(all_periods, return_counts=True)
+    # 计算每个周期的总能量（权重）
+    period_energy = {p: 0.0 for p in unique_periods}
+    for p, e in zip(all_periods, all_energies):
+        period_energy[p] += e
+    # 按（频次×能量）排序
+    period_scores = [counts[i] * period_energy[unique_periods[i]] for i in range(len(unique_periods))]
+    top_k_idx = np.argsort(period_scores)[-k:][::-1]
+    top_periods = unique_periods[top_k_idx].astype(int)
+
+    # 计算周期权重（归一化能量）
+    total_energy = sum(period_energy[p] for p in top_periods)
+    weights = np.array([period_energy[p]/total_energy for p in top_periods])
+    period_weights = torch.tensor(weights, device=device).repeat(B, 1)  # [B, k]
 
     return top_periods, period_weights
 
@@ -90,9 +115,8 @@ class TimesBlock(nn.Module):
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
-        self.use_wpt = True  # 已开启WPT
-        self.wpt_level = 2
-        # parameter-efficient design
+        self.use_wpt = True  # 启用小波包
+        self.wpt_level = 2  # 2级分解
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff,
                                num_kernels=configs.num_kernels),
@@ -110,32 +134,26 @@ class TimesBlock(nn.Module):
 
         res = []
         for i in range(self.k):
-            period = period_list[i]
+            period = period_list[i] if i < len(period_list) else T//2  # 避免索引越界
             # padding
             if (self.seq_len + self.pred_len) % period != 0:
-                length = (
-                                 ((self.seq_len + self.pred_len) // period) + 1) * period
-                padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
+                length = ((self.seq_len + self.pred_len) // period + 1) * period
+                padding = torch.zeros([x.shape[0], length - (self.seq_len + self.pred_len), x.shape[2]]).to(x.device)
                 out = torch.cat([x, padding], dim=1)
             else:
-                length = (self.seq_len + self.pred_len)
+                length = self.seq_len + self.pred_len
                 out = x
             # reshape
-            out = out.reshape(B, length // period, period,
-                              N).permute(0, 3, 1, 2).contiguous()
-            # 2D conv: from 1d Variation to 2d Variation
+            out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
             out = self.conv(out)
-            # reshape back
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
             res.append(out[:, :(self.seq_len + self.pred_len), :])
         res = torch.stack(res, dim=-1)
-        # adaptive aggregation
+        # 自适应聚合（使用能量权重）
         period_weight = F.softmax(period_weight, dim=1)
-        period_weight = period_weight.unsqueeze(
-            1).unsqueeze(1).repeat(1, T, N, 1)
+        period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
         res = torch.sum(res * period_weight, -1)
-        # residual connection
-        res = res + x
+        res = res + x  # 残差连接
         return res
 
 
@@ -157,125 +175,83 @@ class Model(nn.Module):
                                            configs.dropout)
         self.layer = configs.e_layers
         self.layer_norm = nn.LayerNorm(configs.d_model)
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            self.predict_linear = nn.Linear(
-                self.seq_len, self.pred_len + self.seq_len)
-            self.projection = nn.Linear(
-                configs.d_model, configs.c_out, bias=True)
-        if self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
-            self.projection = nn.Linear(
-                configs.d_model, configs.c_out, bias=True)
+        if self.task_name in ['long_term_forecast', 'short_term_forecast']:
+            self.predict_linear = nn.Linear(self.seq_len, self.pred_len + self.seq_len)
+            self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
+        if self.task_name in ['imputation', 'anomaly_detection']:
+            self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
         if self.task_name == 'classification':
             self.act = F.gelu
             self.dropout = nn.Dropout(configs.dropout)
-            self.projection = nn.Linear(
-                configs.d_model * configs.seq_len, configs.num_class)
+            self.projection = nn.Linear(configs.d_model * configs.seq_len, configs.num_class)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # Normalization from Non-stationary Transformer
         means = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc.sub(means)
-        stdev = torch.sqrt(
-            torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
         x_enc = x_enc.div(stdev)
 
-        # embedding
         enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
-        enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(
-            0, 2, 1)  # align temporal dimension
-        # TimesNet
+        enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(0, 2, 1)
         for i in range(self.layer):
             enc_out = self.layer_norm(self.model[i](enc_out))
-        # project back
         dec_out = self.projection(enc_out)
 
-        # De-Normalization from Non-stationary Transformer
-        dec_out = dec_out.mul(
-                  (stdev[:, 0, :].unsqueeze(1).repeat(
-                      1, self.pred_len + self.seq_len, 1)))
-        dec_out = dec_out.add(
-                  (means[:, 0, :].unsqueeze(1).repeat(
-                      1, self.pred_len + self.seq_len, 1)))
+        dec_out = dec_out.mul((stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1)))
+        dec_out = dec_out.add((means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1)))
         return dec_out
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
-        # Normalization from Non-stationary Transformer
         means = torch.sum(x_enc, dim=1) / torch.sum(mask == 1, dim=1)
         means = means.unsqueeze(1).detach()
         x_enc = x_enc.sub(means)
         x_enc = x_enc.masked_fill(mask == 0, 0)
-        stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=1) /
-                           torch.sum(mask == 1, dim=1) + 1e-5)
+        stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=1) / torch.sum(mask == 1, dim=1) + 1e-5)
         stdev = stdev.unsqueeze(1).detach()
         x_enc = x_enc.div(stdev)
 
-        # embedding
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
-        # TimesNet
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)
         for i in range(self.layer):
             enc_out = self.layer_norm(self.model[i](enc_out))
-        # project back
         dec_out = self.projection(enc_out)
 
-        # De-Normalization from Non-stationary Transformer
-        dec_out = dec_out.mul(
-                  (stdev[:, 0, :].unsqueeze(1).repeat(
-                      1, self.pred_len + self.seq_len, 1)))
-        dec_out = dec_out.add(
-                  (means[:, 0, :].unsqueeze(1).repeat(
-                      1, self.pred_len + self.seq_len, 1)))
+        dec_out = dec_out.mul((stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1)))
+        dec_out = dec_out.add((means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1)))
         return dec_out
 
     def anomaly_detection(self, x_enc):
-        # Normalization from Non-stationary Transformer
         means = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc.sub(means)
-        stdev = torch.sqrt(
-            torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
         x_enc = x_enc.div(stdev)
 
-        # embedding
-        enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
-        # TimesNet
+        enc_out = self.enc_embedding(x_enc, None)
         for i in range(self.layer):
             enc_out = self.layer_norm(self.model[i](enc_out))
-        # project back
         dec_out = self.projection(enc_out)
 
-        # De-Normalization from Non-stationary Transformer
-        dec_out = dec_out.mul(
-                  (stdev[:, 0, :].unsqueeze(1).repeat(
-                      1, self.pred_len + self.seq_len, 1)))
-        dec_out = dec_out.add(
-                  (means[:, 0, :].unsqueeze(1).repeat(
-                      1, self.pred_len + self.seq_len, 1)))
+        dec_out = dec_out.mul((stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1)))
+        dec_out = dec_out.add((means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1)))
         return dec_out
 
     def classification(self, x_enc, x_mark_enc):
-        # embedding
-        enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
-        # TimesNet
+        enc_out = self.enc_embedding(x_enc, None)
         for i in range(self.layer):
             enc_out = self.layer_norm(self.model[i](enc_out))
 
-        # Output
-        # the output transformer encoder/decoder embeddings don't include non-linearity
         output = self.act(enc_out)
         output = self.dropout(output)
-        # zero-out padding embeddings
         output = output * x_mark_enc.unsqueeze(-1)
-        # (batch_size, seq_length * d_model)
         output = output.reshape(output.shape[0], -1)
-        output = self.projection(output)  # (batch_size, num_classes)
+        output = self.projection(output)
         return output
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+        if self.task_name in ['long_term_forecast', 'short_term_forecast']:
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]  # [B, L, D]
+            return dec_out[:, -self.pred_len:, :]
         if self.task_name == 'imputation':
-            return self.imputation(
-                x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
+            return self.imputation(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
         if self.task_name == 'anomaly_detection':
             return self.anomaly_detection(x_enc)
         if self.task_name == 'classification':
