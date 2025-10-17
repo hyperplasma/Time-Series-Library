@@ -60,144 +60,48 @@ class RevIN(nn.Module):
         return x
 
 
-class Enhanced_Inception_Block(nn.Module):
+class SeriesDecomp(nn.Module):
     """
-    核心创新：增强的Inception块
-    1. 添加深度可分离卷积（减少参数、增强特征提取）
-    2. 添加SE注意力模块（通道自适应重标定）
+    核心创新1：可学习的时序分解（来自Autoformer）
+    使用移动平均提取趋势，残差作为季节性
     """
-    def __init__(self, in_channels, out_channels, num_kernels=6):
-        super(Enhanced_Inception_Block, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_kernels = num_kernels
-        
-        # 原始多尺度卷积
-        kernels = []
-        for i in range(self.num_kernels):
-            kernels.append(
-                nn.Conv2d(in_channels, out_channels, 
-                         kernel_size=2 * i + 1, padding=i)
-            )
-        self.kernels = nn.ModuleList(kernels)
-        
-        # SE注意力（轻量级通道注意力）
-        self.se_layer = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_channels, out_channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels // 4, out_channels, 1),
-            nn.Sigmoid()
-        )
-        
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+    def __init__(self, kernel_size):
+        super(SeriesDecomp, self).__init__()
+        self.kernel_size = kernel_size
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
 
     def forward(self, x):
-        # 多尺度卷积
-        res_list = []
-        for i in range(self.num_kernels):
-            res_list.append(self.kernels[i](x))
-        res = torch.stack(res_list, dim=-1).mean(-1)
+        # x: [B, T, C]
+        # padding on both sides
+        front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        x_padded = torch.cat([front, x, end], dim=1)
         
-        # SE通道注意力
-        se_weight = self.se_layer(res)
-        res = res * se_weight
+        # moving average
+        x_padded = x_padded.permute(0, 2, 1)  # [B, C, T]
+        trend = self.avg(x_padded).permute(0, 2, 1)  # [B, T, C]
         
-        return res
+        # seasonal = original - trend
+        seasonal = x - trend
+        
+        return seasonal, trend
 
 
-class AdaptiveFreqFilter(nn.Module):
-    """轻量级自适应频率滤波"""
-    def __init__(self, seq_len, channels):
-        super(AdaptiveFreqFilter, self).__init__()
-        self.seq_len = seq_len
-        freq_dim = seq_len // 2 + 1
-        # 简化：只学习全局频率权重（不分通道）
-        self.freq_weight = nn.Parameter(torch.ones(1, freq_dim, 1))
-        
-    def forward(self, x):
-        B, T, C = x.shape
-        x_freq = torch.fft.rfft(x, dim=1)
-        weight = torch.sigmoid(self.freq_weight)
-        x_freq_filtered = x_freq * weight
-        x_filtered = torch.fft.irfft(x_freq_filtered, n=T, dim=1)
-        return x_filtered
-
-
-class CrossPeriodInteraction(nn.Module):
-    """
-    核心创新：跨周期信息交互
-    不同周期捕捉的模式之间进行轻量级信息交换
-    """
-    def __init__(self, d_model, num_periods):
-        super(CrossPeriodInteraction, self).__init__()
-        self.num_periods = num_periods
-        
-        # 使用1x1卷积实现跨周期特征混合（轻量级）
-        self.period_mixer = nn.Conv1d(
-            in_channels=num_periods,
-            out_channels=num_periods,
-            kernel_size=1,
-            groups=1  # 全连接混合
-        )
-        
-    def forward(self, multi_period_features):
-        # multi_period_features: [B, T, C, K]
-        B, T, C, K = multi_period_features.shape
-        
-        # 重塑为 [B*T*C, K]
-        x = multi_period_features.reshape(B * T * C, K).unsqueeze(-1)  # [B*T*C, K, 1]
-        
-        # 跨周期混合
-        x = self.period_mixer(x).squeeze(-1)  # [B*T*C, K]
-        
-        # 恢复形状
-        x = x.reshape(B, T, C, K)
-        
-        return x
-
-
-class EnhancedTimesBlock(nn.Module):
-    """
-    改进的TimesBlock：
-    1. 使用增强的Inception块（SE注意力）
-    2. 添加跨周期信息交互
-    3. 轻量级频率滤波
-    4. 可学习残差缩放
-    """
+class TimesBlock(nn.Module):
+    """原版TimesBlock"""
     def __init__(self, configs):
-        super(EnhancedTimesBlock, self).__init__()
+        super(TimesBlock, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
         
-        # 增强的Inception卷积
         self.conv = nn.Sequential(
-            Enhanced_Inception_Block(configs.d_model, configs.d_ff,
-                                    num_kernels=configs.num_kernels),
+            Inception_Block_V1(configs.d_model, configs.d_ff,
+                               num_kernels=configs.num_kernels),
             nn.GELU(),
-            Enhanced_Inception_Block(configs.d_ff, configs.d_model,
-                                    num_kernels=configs.num_kernels)
+            Inception_Block_V1(configs.d_ff, configs.d_model,
+                               num_kernels=configs.num_kernels)
         )
-        
-        # 跨周期信息交互
-        self.cross_period = CrossPeriodInteraction(configs.d_model, configs.top_k)
-        
-        # 频率滤波
-        self.freq_filter = AdaptiveFreqFilter(
-            seq_len=configs.seq_len + configs.pred_len,
-            channels=configs.d_model
-        )
-        
-        # 可学习残差缩放
-        self.residual_scale = nn.Parameter(torch.tensor(0.1))  # 初始化为0.1
 
     def forward(self, x):
         B, T, N = x.size()
@@ -213,41 +117,55 @@ class EnhancedTimesBlock(nn.Module):
             else:
                 length = (self.seq_len + self.pred_len)
                 out = x
-            
-            # 2D变换 + 增强的Inception卷积
             out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
             out = self.conv(out)
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
             res.append(out[:, :(self.seq_len + self.pred_len), :])
-        
-        # 堆叠多周期结果
-        res = torch.stack(res, dim=-1)  # [B, T, N, K]
-        
-        # 跨周期信息交互（核心创新）
-        res = self.cross_period(res)
-        
-        # 周期加权聚合
+        res = torch.stack(res, dim=-1)
         period_weight = F.softmax(period_weight, dim=1)
         period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
         res = torch.sum(res * period_weight, -1)
-        
-        # 频率滤波
-        res = self.freq_filter(res)
-        
-        # 残差连接（可学习缩放）
-        res = res + self.residual_scale * x
-        
+        res = res + x
         return res
+
+
+class DecompTimesBlock(nn.Module):
+    """
+    核心创新2：分解增强的TimesBlock
+    分别处理季节性和趋势，然后融合
+    """
+    def __init__(self, configs):
+        super(DecompTimesBlock, self).__init__()
+        # 时序分解
+        self.decomp = SeriesDecomp(kernel_size=25)
+        
+        # 季节性处理（使用TimesBlock捕捉周期模式）
+        self.seasonal_block = TimesBlock(configs)
+        
+        # 趋势处理（简单的线性层）
+        self.trend_projection = nn.Linear(configs.d_model, configs.d_model)
+        
+    def forward(self, x):
+        # 分解
+        seasonal, trend = self.decomp(x)
+        
+        # 分别处理
+        seasonal_out = self.seasonal_block(seasonal)
+        trend_out = self.trend_projection(trend)
+        
+        # 融合
+        out = seasonal_out + trend_out
+        return out
 
 
 class Model(nn.Module):
     """
-    Enhanced TimesNet with:
-    1. RevIN normalization
-    2. Enhanced Inception Block (with SE attention)
-    3. Cross-Period Interaction
-    4. Adaptive Frequency Filtering
-    5. Learnable Residual Scaling
+    TimesNet + RevIN + Series Decomposition
+    
+    核心改进：
+    1. RevIN标准化（已验证有效）
+    2. 显式的趋势-季节性分解（来自Autoformer）
+    3. 分别建模趋势和季节性
     """
 
     def __init__(self, configs):
@@ -259,12 +177,13 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         
         # RevIN
-        self.use_revin = getattr(configs, 'use_revin', True)
-        if self.use_revin:
-            self.revin_layer = RevIN(configs.enc_in, affine=True)
+        self.revin_layer = RevIN(configs.enc_in, affine=True)
         
-        # 增强的TimesBlock
-        self.model = nn.ModuleList([EnhancedTimesBlock(configs) 
+        # 输入层分解
+        self.decomp_input = SeriesDecomp(kernel_size=25)
+        
+        # 分解增强的TimesBlock
+        self.model = nn.ModuleList([DecompTimesBlock(configs) 
                                     for _ in range(configs.e_layers)])
         
         self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, 
@@ -276,6 +195,13 @@ class Model(nn.Module):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.predict_linear = nn.Linear(self.seq_len, self.pred_len + self.seq_len)
             self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
+            
+            # 趋势预测分支
+            self.trend_projection = nn.Sequential(
+                nn.Linear(self.seq_len, self.pred_len + self.seq_len),
+                nn.Linear(configs.enc_in, configs.c_out)
+            )
+            
         if self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
             self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
         if self.task_name == 'classification':
@@ -284,27 +210,30 @@ class Model(nn.Module):
             self.projection = nn.Linear(configs.d_model * configs.seq_len, configs.num_class)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        if self.use_revin:
-            x_enc = self.revin_layer(x_enc, 'norm')
-        else:
-            means = x_enc.mean(1, keepdim=True).detach()
-            x_enc = x_enc - means
-            stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-            x_enc = x_enc / stdev
-
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        # RevIN normalization
+        x_enc = self.revin_layer(x_enc, 'norm')
+        
+        # 输入分解
+        seasonal_init, trend_init = self.decomp_input(x_enc)
+        
+        # 季节性路径（主路径）
+        enc_out = self.enc_embedding(seasonal_init, x_mark_enc)
         enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(0, 2, 1)
         
         for i in range(self.layer):
             enc_out = self.layer_norm(self.model[i](enc_out))
         
-        dec_out = self.projection(enc_out)
+        seasonal_out = self.projection(enc_out)
+        
+        # 趋势路径（辅助路径）
+        trend_out = self.trend_projection[0](trend_init.permute(0, 2, 1)).permute(0, 2, 1)
+        trend_out = self.trend_projection[1](trend_out)
+        
+        # 融合季节性和趋势
+        dec_out = seasonal_out + trend_out
 
-        if self.use_revin:
-            dec_out = self.revin_layer(dec_out, 'denorm')
-        else:
-            dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
-            dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
+        # RevIN denormalization
+        dec_out = self.revin_layer(dec_out, 'denorm')
         
         return dec_out
 
