@@ -19,15 +19,18 @@ def FFT_for_Period(x, k=2):
     return period, abs(xf).mean(-1)[:, top_list]
 
 
-def WPT_for_Period(x, k=2, level=3, wave='db4', energy_threshold=60):
+def WPT_for_Period(x, k=2, level=2, wave='db4', energy_threshold=0.5):
     """
-    使用小波包变换检测周期（针对ETT/Weather/Exchange数据集优化）
+    混合FFT和WPT的周期检测策略
+    - 以FFT为主干（高权重），确保基础性能
+    - WPT作为辅助（低权重），提供精细化调整
+    
     Args:
         x: 输入张量 [B, T, C]
         k: 返回top-k个周期
-        level: 小波包分解级别（3级=8个子带，适合捕捉日/周多尺度周期）
-        wave: 小波函数（db4为工业标准，平衡性能与噪声抑制）
-        energy_threshold: 能量阈值百分比（60%过滤中等噪声）
+        level: 小波包分解级别（降低到2级，减少过拟合）
+        wave: 小波函数（db4更简单稳定）
+        energy_threshold: 能量阈值（0.5保留更多信息）
     Returns:
         period: top-k周期数组
         period_weight: 对应的权重 [B, k]
@@ -36,81 +39,111 @@ def WPT_for_Period(x, k=2, level=3, wave='db4', energy_threshold=60):
     device = x.device
     dtype = x.dtype
     
+    # 先用FFT快速定位主周期（作为主干）
+    fft_periods, fft_weights = FFT_for_Period(x, k)
+    
     x_np = x.detach().cpu().numpy()
     
     all_periods = []
     all_weights = []
     
     for b in range(B):
-        batch_periods = []
-        batch_weights = []
+        periods_dict = {}
         
+        # 将FFT结果加入候选池（给予2倍权重，确保FFT主导）
+        for i in range(k):
+            period = int(fft_periods[i])
+            if period > 0:
+                periods_dict[period] = float(fft_weights[b, i].item()) * 2.0
+        
+        # WPT精细化调整（权重降低到0.3，避免干扰FFT）
         for c in range(C):
             signal = x_np[b, :, c]
             
-            wp = pywt.WaveletPacket(data=signal, wavelet=wave, mode='symmetric', maxlevel=level)
-            
-            nodes = [node.path for node in wp.get_level(level, 'freq')]
-            
-            energies = []
-            subbands = []
-            for node_path in nodes:
-                subband = wp[node_path].data
-                energy = np.sum(subband ** 2)
-                energies.append(energy)
-                subbands.append(subband)
-            
-            energies = np.array(energies)
-            energy_thresh = np.percentile(energies, energy_threshold)
-            high_energy_indices = np.where(energies >= energy_thresh)[0]
-            
-            periods_dict = {}
-            for idx in high_energy_indices:
-                subband = subbands[idx]
-                subband_energy = energies[idx]
+            try:
+                wp = pywt.WaveletPacket(data=signal, wavelet=wave, mode='symmetric', maxlevel=level)
+                nodes = [node.path for node in wp.get_level(level, 'freq')]
                 
-                fft_vals = np.fft.rfft(subband)
-                fft_freqs = np.fft.rfftfreq(len(subband))
-                amplitudes = np.abs(fft_vals)
+                energies = []
+                subbands = []
+                for node_path in nodes:
+                    subband = wp[node_path].data
+                    energy = np.sum(subband ** 2)
+                    energies.append(energy)
+                    subbands.append(subband)
                 
-                amplitudes[0] = 0
-                top_freq_idx = np.argmax(amplitudes)
-                
-                if fft_freqs[top_freq_idx] > 0:
-                    period = int(T / (fft_freqs[top_freq_idx] * (2 ** level)))
+                energies = np.array(energies)
+                if len(energies) == 0:
+                    continue
                     
-                    if 3 <= period <= T:
-                        weight = amplitudes[top_freq_idx] * subband_energy
-                        if period in periods_dict:
-                            periods_dict[period] += weight
-                        else:
-                            periods_dict[period] = weight
-            
-            if periods_dict:
-                for period, weight in periods_dict.items():
-                    batch_periods.append(period)
-                    batch_weights.append(weight)
+                energy_threshold_val = np.percentile(energies, energy_threshold * 100)
+                high_energy_indices = np.where(energies >= energy_threshold_val)[0]
+                
+                for idx in high_energy_indices:
+                    subband = subbands[idx]
+                    subband_energy = energies[idx]
+                    
+                    fft_vals = np.fft.rfft(subband)
+                    fft_freqs = np.fft.rfftfreq(len(subband))
+                    amplitudes = np.abs(fft_vals)
+                    amplitudes[0] = 0
+                    
+                    if len(amplitudes) > 1:
+                        top_freq_idx = np.argmax(amplitudes)
+                        
+                        if fft_freqs[top_freq_idx] > 0:
+                            period = int(T / (fft_freqs[top_freq_idx] * (2 ** level)))
+                            
+                            # 周期有效性约束
+                            if 6 <= period <= T // 2:
+                                # WPT权重降低到0.3，避免过度干扰FFT结果
+                                weight = amplitudes[top_freq_idx] * subband_energy * 0.3
+                                if period in periods_dict:
+                                    periods_dict[period] += weight
+                                else:
+                                    periods_dict[period] = weight
+                        
+            except Exception:
+                continue
         
-        if batch_periods:
-            period_weight_dict = {}
-            for p, w in zip(batch_periods, batch_weights):
-                if p in period_weight_dict:
-                    period_weight_dict[p] += w
-                else:
-                    period_weight_dict[p] = w
+        # 周期去重：合并相近周期（差距<15%视为同一周期）
+        if periods_dict:
+            merged_periods = {}
+            sorted_items = sorted(periods_dict.items(), key=lambda x: x[1], reverse=True)
             
-            sorted_periods = sorted(period_weight_dict.items(), key=lambda x: x[1], reverse=True)
+            for period, weight in sorted_items:
+                is_duplicate = False
+                for existing_period in list(merged_periods.keys()):
+                    if abs(period - existing_period) / max(existing_period, 1) < 0.15:
+                        merged_periods[existing_period] += weight
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    merged_periods[period] = weight
+            
+            # 排序选择top-k
+            sorted_periods = sorted(merged_periods.items(), key=lambda x: x[1], reverse=True)
             top_k_periods = sorted_periods[:k]
             
             periods = [p for p, _ in top_k_periods]
             weights = [w for _, w in top_k_periods]
             
+            # 不足k时用FFT周期或T//2填充
             while len(periods) < k:
-                periods.append(T // 2)
-                weights.append(0.0)
+                if len(periods) < len(fft_periods):
+                    periods.append(int(fft_periods[len(periods)]))
+                    weights.append(weights[-1] * 0.5 if weights else 0.1)
+                else:
+                    periods.append(T // 2)
+                    weights.append(0.01)
         else:
-            periods = [T // (i + 1) for i in range(k)]
-            weights = [1.0 / k] * k
+            # 完全失败时直接使用FFT结果
+            periods = [int(p) for p in fft_periods]
+            weights = [float(fft_weights[b, i].item()) for i in range(k)]
+        
+        # 确保恰好k个
+        periods = periods[:k]
+        weights = weights[:k]
         
         all_periods.append(periods)
         all_weights.append(weights)
@@ -118,6 +151,7 @@ def WPT_for_Period(x, k=2, level=3, wave='db4', energy_threshold=60):
     period_array = np.array(all_periods)
     weight_array = np.array(all_weights)
     
+    # 取每个位置的众数作为最终周期
     final_periods = []
     for i in range(k):
         period_col = period_array[:, i]
@@ -138,9 +172,9 @@ class TimesBlock(nn.Module):
         self.k = configs.top_k
         
         self.use_wpt = True
-        self.wpt_level = 3
+        self.wpt_level = 2
         self.wave = 'db4'
-        self.energy_threshold = 60
+        self.energy_threshold = 0.5
         
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff,
@@ -153,10 +187,7 @@ class TimesBlock(nn.Module):
     def forward(self, x):
         B, T, N = x.size()
         
-        if self.use_wpt:
-            period_list, period_weight = WPT_for_Period(x, self.k, self.wpt_level, self.wave, self.energy_threshold)
-        else:
-            period_list, period_weight = FFT_for_Period(x, self.k)
+        period_list, period_weight = WPT_for_Period(x, self.k, self.wpt_level, self.wave, self.energy_threshold)
 
         res = []
         for i in range(self.k):
