@@ -20,7 +20,8 @@ def FFT_for_Period(x, k=2):
 class RevIN(nn.Module):
     """
     Reversible Instance Normalization
-    来自论文: "Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift"
+    论文: "Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift"
+    已被PatchTST、DLinear等多个SOTA模型验证有效
     """
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -73,16 +74,13 @@ class TimesBlock(nn.Module):
         self.pred_len = configs.pred_len
         self.k = configs.top_k
         
-        # Channel Independence: 每个通道独立卷积
-        self.conv = nn.ModuleList([
-            nn.Sequential(
-                Inception_Block_V1(configs.d_model, configs.d_ff,
-                                   num_kernels=configs.num_kernels),
-                nn.GELU(),
-                Inception_Block_V1(configs.d_ff, configs.d_model,
-                                   num_kernels=configs.num_kernels)
-            ) for _ in range(configs.enc_in)
-        ])
+        self.conv = nn.Sequential(
+            Inception_Block_V1(configs.d_model, configs.d_ff,
+                               num_kernels=configs.num_kernels),
+            nn.GELU(),
+            Inception_Block_V1(configs.d_ff, configs.d_model,
+                               num_kernels=configs.num_kernels)
+        )
 
     def forward(self, x):
         B, T, N = x.size()
@@ -91,7 +89,6 @@ class TimesBlock(nn.Module):
         res = []
         for i in range(self.k):
             period = period_list[i]
-            
             if (self.seq_len + self.pred_len) % period != 0:
                 length = (((self.seq_len + self.pred_len) // period) + 1) * period
                 padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
@@ -99,20 +96,10 @@ class TimesBlock(nn.Module):
             else:
                 length = (self.seq_len + self.pred_len)
                 out = x
-            
-            # Channel-wise processing
             out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
-            
-            # 每个通道独立处理
-            channel_outputs = []
-            for c in range(N):
-                channel_out = self.conv[c](out[:, c:c+1, :, :])
-                channel_outputs.append(channel_out)
-            out = torch.cat(channel_outputs, dim=1)
-            
+            out = self.conv(out)
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
             res.append(out[:, :(self.seq_len + self.pred_len), :])
-            
         res = torch.stack(res, dim=-1)
         period_weight = F.softmax(period_weight, dim=1)
         period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
@@ -123,7 +110,8 @@ class TimesBlock(nn.Module):
 
 class Model(nn.Module):
     """
-    Enhanced TimesNet with Channel Independence and RevIN
+    TimesNet + RevIN
+    核心改进：使用RevIN替代原版标准化，已被多个SOTA模型验证有效
     """
 
     def __init__(self, configs):
@@ -134,8 +122,10 @@ class Model(nn.Module):
         self.label_len = configs.label_len
         self.pred_len = configs.pred_len
         
-        # RevIN normalization
-        self.revin = RevIN(configs.enc_in) if configs.use_revin else None
+        # RevIN: 关键改进点
+        self.use_revin = getattr(configs, 'use_revin', True)
+        if self.use_revin:
+            self.revin_layer = RevIN(configs.enc_in, affine=True)
         
         self.model = nn.ModuleList([TimesBlock(configs) for _ in range(configs.e_layers)])
         self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq,
@@ -154,9 +144,8 @@ class Model(nn.Module):
             self.projection = nn.Linear(configs.d_model * configs.seq_len, configs.num_class)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # RevIN normalization
-        if self.revin:
-            x_enc = self.revin(x_enc, 'norm')
+        if self.use_revin:
+            x_enc = self.revin_layer(x_enc, 'norm')
         else:
             means = x_enc.mean(1, keepdim=True).detach()
             x_enc = x_enc - means
@@ -171,9 +160,8 @@ class Model(nn.Module):
         
         dec_out = self.projection(enc_out)
 
-        # RevIN denormalization
-        if self.revin:
-            dec_out = self.revin(dec_out, 'denorm')
+        if self.use_revin:
+            dec_out = self.revin_layer(dec_out, 'denorm')
         else:
             dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
             dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
