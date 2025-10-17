@@ -7,6 +7,7 @@ from layers.Conv_Blocks import Inception_Block_V1
 
 
 def FFT_for_Period(x, k=2):
+    # [B, T, C]
     xf = torch.fft.rfft(x, dim=1)
     frequency_list = abs(xf).mean(0).mean(-1)
     frequency_list[0] = 0
@@ -17,7 +18,9 @@ def FFT_for_Period(x, k=2):
 
 
 class RevIN(nn.Module):
-    """Reversible Instance Normalization"""
+    """
+    Reversible Instance Normalization
+    """
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
         self.num_features = num_features
@@ -32,6 +35,8 @@ class RevIN(nn.Module):
             x = self._normalize(x)
         elif mode == 'denorm':
             x = self._denormalize(x)
+        else:
+            raise NotImplementedError
         return x
 
     def _init_params(self):
@@ -61,197 +66,44 @@ class RevIN(nn.Module):
 
 
 class AdaptiveFreqFilter(nn.Module):
-    """自适应频率滤波模块"""
+    """
+    自适应频率滤波模块
+    核心思想：在频域自适应学习每个频率分量的重要性，抑制高频噪声
+    """
     def __init__(self, seq_len, channels):
         super(AdaptiveFreqFilter, self).__init__()
         self.seq_len = seq_len
         self.channels = channels
+        # 可学习的频率权重（针对每个通道）
         freq_dim = seq_len // 2 + 1
         self.freq_weight = nn.Parameter(torch.ones(1, freq_dim, channels))
         self.freq_bias = nn.Parameter(torch.zeros(1, freq_dim, channels))
         
     def forward(self, x):
+        # x: [B, T, C]
         B, T, C = x.shape
-        x_freq = torch.fft.rfft(x, dim=1)
-        weight = torch.sigmoid(self.freq_weight + self.freq_bias)
+        
+        # FFT到频域
+        x_freq = torch.fft.rfft(x, dim=1)  # [B, T//2+1, C]
+        
+        # 自适应加权
+        weight = torch.sigmoid(self.freq_weight + self.freq_bias)  # [1, T//2+1, C]
         x_freq_filtered = x_freq * weight
-        x_filtered = torch.fft.irfft(x_freq_filtered, n=T, dim=1)
+        
+        # 逆FFT回时域
+        x_filtered = torch.fft.irfft(x_freq_filtered, n=T, dim=1)  # [B, T, C]
+        
         return x_filtered
 
 
-class HierarchicalScaleDecomposer(nn.Module):
-    """
-    核心创新1：层次化多尺度分解
-    将时间序列分解为多个尺度：细粒度、中粒度、粗粒度
-    """
-    def __init__(self, seq_len, d_model):
-        super(HierarchicalScaleDecomposer, self).__init__()
-        self.seq_len = seq_len
-        
-        # 多尺度平均池化（模拟不同时间粒度）
-        self.scale_pools = nn.ModuleList([
-            nn.AvgPool1d(kernel_size=k, stride=k, padding=0)
-            for k in [2, 4, 8]  # 细->中->粗
-        ])
-        
-        # 尺度特定的特征提取
-        self.scale_projections = nn.ModuleList([
-            nn.Linear(d_model, d_model) for _ in range(3)
-        ])
-        
-    def forward(self, x):
-        # x: [B, T, C]
-        B, T, C = x.shape
-        x_permute = x.permute(0, 2, 1)  # [B, C, T]
-        
-        multi_scale_features = []
-        for i, pool in enumerate(self.scale_pools):
-            # 下采样到不同尺度
-            x_scale = pool(x_permute)  # [B, C, T//k]
-            x_scale = x_scale.permute(0, 2, 1)  # [B, T//k, C]
-            
-            # 尺度特定投影
-            x_scale = self.scale_projections[i](x_scale)
-            
-            # 上采样回原始长度
-            x_scale = F.interpolate(
-                x_scale.permute(0, 2, 1), 
-                size=T, 
-                mode='linear', 
-                align_corners=False
-            ).permute(0, 2, 1)
-            
-            multi_scale_features.append(x_scale)
-        
-        return multi_scale_features  # 返回3个不同尺度的特征
-
-
-class PredictiveGuidanceModule(nn.Module):
-    """
-    核心创新2：预测引导机制
-    粗尺度预测指导细尺度预测，形成层次化监督
-    """
-    def __init__(self, d_model, pred_len):
-        super(PredictiveGuidanceModule, self).__init__()
-        self.pred_len = pred_len
-        
-        # 粗尺度预测器（快速预测长期趋势）
-        self.coarse_predictor = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model)
-        )
-        
-        # 精细预测器（在粗预测基础上细化）
-        self.fine_predictor = nn.Sequential(
-            nn.Linear(d_model * 2, d_model * 2),  # 拼接粗预测和原特征
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model)
-        )
-        
-        # 引导注意力
-        self.guidance_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=4,
-            batch_first=True
-        )
-        
-    def forward(self, x):
-        # x: [B, T, C]
-        
-        # 1. 粗尺度快速预测
-        coarse_pred = self.coarse_predictor(x)  # [B, T, C]
-        
-        # 2. 使用粗预测作为query引导细预测
-        guided_feat, _ = self.guidance_attn(
-            query=coarse_pred,
-            key=x,
-            value=x
-        )
-        
-        # 3. 融合粗预测和引导特征
-        combined = torch.cat([coarse_pred, guided_feat], dim=-1)  # [B, T, 2C]
-        fine_pred = self.fine_predictor(combined)  # [B, T, C]
-        
-        return fine_pred, coarse_pred
-
-
-class AdaptiveScaleFusion(nn.Module):
-    """
-    核心创新3：自适应尺度融合
-    动态学习不同尺度的贡献权重
-    """
-    def __init__(self, d_model, num_scales=3):
-        super(AdaptiveScaleFusion, self).__init__()
-        self.num_scales = num_scales
-        
-        # 基于注意力的尺度权重学习
-        self.scale_attention = nn.Sequential(
-            nn.Linear(d_model * num_scales, d_model),
-            nn.Tanh(),
-            nn.Linear(d_model, num_scales),
-            nn.Softmax(dim=-1)
-        )
-        
-        # 尺度特定门控
-        self.scale_gates = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.Sigmoid()
-            ) for _ in range(num_scales)
-        ])
-        
-    def forward(self, multi_scale_features):
-        # multi_scale_features: list of [B, T, C]
-        B, T, C = multi_scale_features[0].shape
-        
-        # 拼接所有尺度特征用于权重计算
-        concat_features = torch.cat(multi_scale_features, dim=-1)  # [B, T, 3C]
-        
-        # 计算全局尺度权重
-        scale_weights = self.scale_attention(concat_features)  # [B, T, 3]
-        
-        # 门控每个尺度
-        fused_output = 0
-        for i, feat in enumerate(multi_scale_features):
-            gate = self.scale_gates[i](feat)
-            gated_feat = feat * gate
-            weight = scale_weights[:, :, i:i+1]
-            fused_output = fused_output + gated_feat * weight
-        
-        return fused_output
-
-
-class DualPathTimesBlock(nn.Module):
-    """
-    增强的TimesBlock：整合所有创新
-    """
+class TimesBlock(nn.Module):
     def __init__(self, configs):
-        super(DualPathTimesBlock, self).__init__()
+        super(TimesBlock, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
-        self.d_model = configs.d_model
         
-        # 层次化多尺度分解
-        self.scale_decomposer = HierarchicalScaleDecomposer(
-            seq_len=configs.seq_len + configs.pred_len,
-            d_model=configs.d_model
-        )
-        
-        # 预测引导模块
-        self.predictive_guidance = PredictiveGuidanceModule(
-            d_model=configs.d_model,
-            pred_len=configs.pred_len
-        )
-        
-        # 自适应尺度融合
-        self.scale_fusion = AdaptiveScaleFusion(
-            d_model=configs.d_model,
-            num_scales=3
-        )
-        
-        # 原有周期卷积（用于确定性模式）
+        # 原有卷积模块
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff,
                                num_kernels=configs.num_kernels),
@@ -260,40 +112,29 @@ class DualPathTimesBlock(nn.Module):
                                num_kernels=configs.num_kernels)
         )
         
-        # 频率滤波
+        # 新增：自适应频率滤波
         self.freq_filter = AdaptiveFreqFilter(
-            seq_len=configs.seq_len + configs.pred_len,
+            seq_len=configs.seq_len + configs.pred_len, 
             channels=configs.d_model
         )
         
-        # 可学习残差缩放
+        # 新增：可学习的残差缩放因子
         self.residual_scale = nn.Parameter(torch.ones(1))
-        
+
     def forward(self, x):
         B, T, N = x.size()
-        
-        # 1. 多尺度分解
-        multi_scale_features = self.scale_decomposer(x)
-        
-        # 2. 尺度融合
-        scale_fused = self.scale_fusion(multi_scale_features)
-        
-        # 3. 预测引导
-        guided_pred, coarse_pred = self.predictive_guidance(scale_fused)
-        
-        # 4. 传统周期处理（确定性路径）
         period_list, period_weight = FFT_for_Period(x, self.k)
-        
+
         res = []
         for i in range(self.k):
             period = period_list[i]
             if (self.seq_len + self.pred_len) % period != 0:
                 length = (((self.seq_len + self.pred_len) // period) + 1) * period
                 padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
-                out = torch.cat([guided_pred, padding], dim=1)
+                out = torch.cat([x, padding], dim=1)
             else:
                 length = (self.seq_len + self.pred_len)
-                out = guided_pred
+                out = x
             
             out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
             out = self.conv(out)
@@ -303,27 +144,20 @@ class DualPathTimesBlock(nn.Module):
         res = torch.stack(res, dim=-1)
         period_weight = F.softmax(period_weight, dim=1)
         period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
-        periodic_out = torch.sum(res * period_weight, -1)
+        res = torch.sum(res * period_weight, -1)
         
-        # 5. 频率滤波
-        periodic_out = self.freq_filter(periodic_out)
+        # 新增：频率滤波
+        res = self.freq_filter(res)
         
-        # 6. 多路径融合：预测引导路径 + 周期路径 + 残差
-        output = 0.4 * guided_pred + 0.4 * periodic_out + self.residual_scale * 0.2 * x
+        # 新增：可学习残差缩放
+        res = res + self.residual_scale * x
         
-        return output
+        return res
 
 
 class Model(nn.Module):
     """
-    Hierarchical Multi-Scale Predictive Guidance TimesNet (HMPG-TimesNet)
-    
-    核心创新：
-    1. 层次化多尺度分解（细->中->粗）
-    2. 预测引导机制（粗尺度指导细尺度）
-    3. 自适应尺度融合（动态权重学习）
-    4. 双路径架构（确定性+随机性）
-    5. RevIN + 频率滤波 + 可学习残差
+    TimesNet + RevIN + Adaptive Frequency Filtering
     """
 
     def __init__(self, configs):
@@ -334,14 +168,11 @@ class Model(nn.Module):
         self.label_len = configs.label_len
         self.pred_len = configs.pred_len
         
-        # RevIN
         self.use_revin = getattr(configs, 'use_revin', True)
         if self.use_revin:
             self.revin_layer = RevIN(configs.enc_in, affine=True)
         
-        # 增强的TimesBlock
-        self.model = nn.ModuleList([DualPathTimesBlock(configs) for _ in range(configs.e_layers)])
-        
+        self.model = nn.ModuleList([TimesBlock(configs) for _ in range(configs.e_layers)])
         self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq,
                                            configs.dropout)
         self.layer = configs.e_layers
