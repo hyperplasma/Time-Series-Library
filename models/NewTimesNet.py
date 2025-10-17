@@ -9,7 +9,7 @@ from layers.Conv_Blocks import Inception_Block_V1
 
 
 def FFT_for_Period(x, k=2):
-    # [B, T, C]
+    # [B, T, C]，保持float32类型
     xf = torch.fft.rfft(x, dim=1)
     frequency_list = abs(xf).mean(0).mean(-1)
     frequency_list[0] = 0
@@ -21,91 +21,83 @@ def FFT_for_Period(x, k=2):
 
 def WPT_for_Period(x, k=2, level=2, wave='db4'):
     """
-    参考pywt官方小波包示例 + 信号处理中周期提取的标准流程
-    1. 小波包分解 → 2. 子带能量计算 → 3. 筛选高能量子带 → 4. 提取周期并校验 → 5. 能量加权融合
+    核心修正：所有张量强制为float32，与模型类型一致
     """
-    B, T, C = x.shape  # [批大小, 序列长度, 特征数]
+    B, T, C = x.shape
     device = x.device
-    x_np = x.detach().cpu().numpy()  # 转为numpy（pywt更适配numpy）
+    dtype = x.dtype  # 获取输入数据类型（通常是float32）
+    x_np = x.detach().cpu().numpy().astype(np.float32)  # 强制numpy为float32
     all_periods = []
-    all_energies = []  # 用能量作为权重（替代振幅）
+    all_energies = []
 
-    # 遍历每个样本（确保批量处理正确性）
     for b in range(B):
-        sample = x_np[b]  # [T, C]
-        # 对每个特征通道单独处理（避免跨通道干扰）
+        sample = x_np[b]
         for c in range(C):
-            seq = sample[:, c]  # [T]，单特征序列
+            seq = sample[:, c].astype(np.float32)  # 单特征序列保持float32
 
-            # 1. 小波包分解（pywt标准实现）
+            # 小波包分解
             wp = pywt.WaveletPacket(data=seq, wavelet=wave, mode='symmetric', maxlevel=level)
-            # 获取所有子带节点（如2级分解：['aa', 'ad', 'da', 'dd']）
             nodes = [node.path for node in wp.get_level(level, 'natural')]
 
-            # 2. 计算每个子带的能量（能量高的子带包含更多有效信息）
+            # 子带能量计算（强制float32）
             subband_energies = {}
             subband_data = {}
             for node in nodes:
-                data = wp[node].data  # 子带数据
-                energy = torch.sum(torch.tensor(data)**2).item()  # 能量=平方和
+                data = wp[node].data.astype(np.float32)  # 子带数据转float32
+                energy = torch.sum(torch.tensor(data, dtype=dtype)**2).item()  # 用模型 dtype
                 subband_energies[node] = energy
                 subband_data[node] = data
 
-            # 3. 筛选高能量子带（保留能量前50%的子带，过滤噪声）
+            # 筛选高能量子带
             sorted_nodes = sorted(subband_energies.items(), key=lambda x: x[1], reverse=True)
-            keep_num = max(1, len(sorted_nodes) // 2)  # 至少保留1个子带
+            keep_num = max(1, len(sorted_nodes) // 2)
             valid_nodes = [node for node, _ in sorted_nodes[:keep_num]]
 
-            # 4. 从有效子带提取周期
+            # 提取周期（全程保持类型一致）
             for node in valid_nodes:
                 data = subband_data[node]
                 T_sub = len(data)
-                if T_sub < 4:  # 子带长度过短，跳过
+                if T_sub < 4:
                     continue
 
-                # 子带FFT
-                xf_sub = torch.fft.rfft(torch.tensor(data))
+                # 子带FFT（强制float32）
+                xf_sub = torch.fft.rfft(torch.tensor(data, dtype=dtype))  # 用模型 dtype
                 amp_sub = abs(xf_sub)
-                amp_sub[0] = 0  # 排除直流分量
-                freq_list_sub = amp_sub.numpy()
+                amp_sub[0] = 0
+                freq_list_sub = amp_sub.cpu().numpy().astype(np.float32)
 
                 # 取top-k频率
                 top_idx = np.argsort(freq_list_sub)[-k:][::-1]
                 top_freq = top_idx
 
-                # 计算周期并映射回原始长度
+                # 周期计算与校验
                 periods_sub = (T_sub // top_freq) * (2 ** level) if T_sub > 0 else []
-                # 周期合理性校验（针对ETTh1：保留24±5、168±20等合理周期）
                 valid_periods = []
                 for p in periods_sub:
                     if (19 <= p <= 29) or (148 <= p <= 188) or (p > 2 and p <= T):
                         valid_periods.append(p)
-                if not valid_periods:  # 无有效周期时用子带主导周期
+                if not valid_periods:
                     valid_periods = [T_sub // top_freq[0] * (2**level)] if len(top_freq) > 0 else [T//2]
 
-                # 收集周期和对应子带能量（能量作为权重）
                 all_periods.extend(valid_periods)
                 all_energies.extend([subband_energies[node]] * len(valid_periods))
 
-    # 5. 按能量加权融合周期（能量高的周期权重更高）
-    if not all_periods:  # 极端情况兜底
-        return np.array([T//2]*k), torch.ones(B, k, device=device)
+    # 周期融合（权重张量强制为模型 dtype）
+    if not all_periods:
+        return np.array([T//2]*k), torch.ones(B, k, device=device, dtype=dtype)
 
-    # 统计周期频次，结合能量加权
     unique_periods, counts = np.unique(all_periods, return_counts=True)
-    # 计算每个周期的总能量（权重）
     period_energy = {p: 0.0 for p in unique_periods}
     for p, e in zip(all_periods, all_energies):
         period_energy[p] += e
-    # 按（频次×能量）排序
     period_scores = [counts[i] * period_energy[unique_periods[i]] for i in range(len(unique_periods))]
     top_k_idx = np.argsort(period_scores)[-k:][::-1]
     top_periods = unique_periods[top_k_idx].astype(int)
 
-    # 计算周期权重（归一化能量）
+    # 权重张量类型与输入一致
     total_energy = sum(period_energy[p] for p in top_periods)
-    weights = np.array([period_energy[p]/total_energy for p in top_periods])
-    period_weights = torch.tensor(weights, device=device).repeat(B, 1)  # [B, k]
+    weights = np.array([period_energy[p]/total_energy for p in top_periods], dtype=np.float32)
+    period_weights = torch.tensor(weights, device=device, dtype=dtype).repeat(B, 1)  # 强制模型 dtype
 
     return top_periods, period_weights
 
@@ -116,8 +108,8 @@ class TimesBlock(nn.Module):
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
-        self.use_wpt = True  # 启用小波包
-        self.wpt_level = 2  # 2级分解
+        self.use_wpt = True
+        self.wpt_level = 2
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff,
                                num_kernels=configs.num_kernels),
@@ -135,26 +127,24 @@ class TimesBlock(nn.Module):
 
         res = []
         for i in range(self.k):
-            period = period_list[i] if i < len(period_list) else T//2  # 避免索引越界
-            # padding
+            period = period_list[i] if i < len(period_list) else T//2
             if (self.seq_len + self.pred_len) % period != 0:
                 length = ((self.seq_len + self.pred_len) // period + 1) * period
-                padding = torch.zeros([x.shape[0], length - (self.seq_len + self.pred_len), x.shape[2]]).to(x.device)
+                padding = torch.zeros([x.shape[0], length - (self.seq_len + self.pred_len), x.shape[2]],
+                                     device=x.device, dtype=x.dtype)  # 保持dtype一致
                 out = torch.cat([x, padding], dim=1)
             else:
                 length = self.seq_len + self.pred_len
                 out = x
-            # reshape
             out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
             out = self.conv(out)
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
             res.append(out[:, :(self.seq_len + self.pred_len), :])
         res = torch.stack(res, dim=-1)
-        # 自适应聚合（使用能量权重）
         period_weight = F.softmax(period_weight, dim=1)
         period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
         res = torch.sum(res * period_weight, -1)
-        res = res + x  # 残差连接
+        res = res + x
         return res
 
 
@@ -195,7 +185,7 @@ class Model(nn.Module):
         enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
         enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(0, 2, 1)
         for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
+            enc_out = self.layer_norm(self.model[i](enc_out))  # 此处类型需一致
         dec_out = self.projection(enc_out)
 
         dec_out = dec_out.mul((stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1)))
