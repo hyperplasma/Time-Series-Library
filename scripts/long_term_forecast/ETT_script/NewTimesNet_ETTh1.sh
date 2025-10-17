@@ -24,7 +24,7 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5 
+  --top_k 3  # change top_k to 3
 
 
 python -u run.py \
@@ -49,7 +49,7 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5
+  --top_k 3   # change top_k to 3
 
 
 python -u run.py \
@@ -74,7 +74,7 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5 
+  --top_k 3   # change top_k to 3
 
 
 python -u run.py \
@@ -99,4 +99,4 @@ python -u run.py \
   --d_ff 32 \
   --des 'Exp' \
   --itr 1 \
-  --top_k 5 
+  --top_k 3   # change top_k to 3
