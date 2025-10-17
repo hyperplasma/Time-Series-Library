@@ -20,59 +20,57 @@ def FFT_for_Period(x, k=2):
 
 
 def WPT_for_Period(x, k=2, level=2, wave='db4'):
-    # 用DWT1D手动实现2级分解（模拟小波包4个子带，解决导入错误）
+    # 核心修复：正确处理DWT1D的返回格式（低频分量 + 高频分量列表）
     B, T, C = x.shape
     device = x.device
-    # 初始化1级DWT（用于多级分解）
     dwt = DWT1D(wave=wave, mode='symmetric').to(device)
-    x_reshaped = x.permute(0, 2, 1)  # [B, C, T]（适配DWT1D输入）
+    x_reshaped = x.permute(0, 2, 1)  # [B, C, T]
 
-    # 2级分解得到4个子带：cA2(低频-低频)、cD2(低频-高频)、cA1D1(高频-低频)、cD1D1(高频-高频)
-    # 第1级分解：得到cA1(低频)、cD1(高频)
-    cA1, cD1 = dwt(x_reshaped)  # cA1: [B, C, 1, T//2], cD1: [B, C, 1, T//2]
-    cA1 = cA1.squeeze(2)  # [B, C, T//2]
-    cD1 = cD1.squeeze(2)  # [B, C, T//2]
+    # 第1级分解：返回 (cA1, [cD1]) → 高频分量是列表，需取第0个元素
+    cA1, cD1_list = dwt(x_reshaped)  # cA1: [B, C, 1, T//2]; cD1_list: [tensor([B,C,1,T//2])]
+    cA1 = cA1.squeeze(2)  # 移除冗余维度 → [B, C, T//2]
+    cD1 = cD1_list[0].squeeze(2)  # 从列表取出cD1张量，再移除维度 → [B, C, T//2]
 
-    # 第2级分解：对cA1分解得到cA2、cD2；对cD1分解得到cA1D1、cD1D1
-    cA2, cD2 = dwt(cA1.unsqueeze(2))  # 需补回通道维度适配DWT1D
-    cA1D1, cD1D1 = dwt(cD1.unsqueeze(2))
-    # 移除冗余维度，得到4个子带（与原小波包子带对应）
-    subbands = [
-        cA2.squeeze(2),    # 子带1：低频-低频（aa）
-        cD2.squeeze(2),    # 子带2：低频-高频（ad）
-        cA1D1.squeeze(2),  # 子带3：高频-低频（da）
-        cD1D1.squeeze(2)   # 子带4：高频-高频（dd）
-    ]
+    # 第2级分解：对cA1分解 → 返回 (cA2, [cD2])
+    cA1_unsqueeze = cA1.unsqueeze(2)  # 补回通道维度（DWT1D要求输入[B,C,1,L]）
+    cA2, cD2_list = dwt(cA1_unsqueeze)
+    cA2 = cA2.squeeze(2)  # [B, C, T//4]
+    cD2 = cD2_list[0].squeeze(2)  # [B, C, T//4]
 
+    # 第2级分解：对cD1分解 → 返回 (cA1D1, [cD1D1])
+    cD1_unsqueeze = cD1.unsqueeze(2)
+    cA1D1, cD1D1_list = dwt(cD1_unsqueeze)
+    cA1D1 = cA1D1.squeeze(2)  # [B, C, T//4]
+    cD1D1 = cD1D1_list[0].squeeze(2)  # [B, C, T//4]
+
+    # 4个子带（与原逻辑一致）
+    subbands = [cA2, cD2, cA1D1, cD1D1]
     all_periods = []
     all_amps = []
-    # 遍历4个子带，提取周期
-    for subband in subbands:
-        T_sub = subband.shape[2]  # 子带长度：T//(2^level)
-        # 子带FFT（按时间维度）
-        xf_sub = torch.fft.rfft(subband, dim=2)  # [B, C, F]
-        amp_sub = abs(xf_sub).mean(1)  # 按通道平均振幅：[B, F]
-        freq_list_sub = amp_sub.mean(0)  # 按样本平均：[F]
-        freq_list_sub[0] = 0  # 排除直流分量
 
-        # 取子带top-k频率
+    for subband in subbands:
+        T_sub = subband.shape[2]
+        xf_sub = torch.fft.rfft(subband, dim=2)
+        amp_sub = abs(xf_sub).mean(1)  # [B, F]
+        freq_list_sub = amp_sub.mean(0)
+        freq_list_sub[0] = 0
+
+        # 取top-k频率
         if len(freq_list_sub) <= k:
             top_list_sub = torch.argsort(freq_list_sub, descending=True)
         else:
             _, top_list_sub = torch.topk(freq_list_sub, k)
 
-        # 映射回原始序列周期（子带周期 × 2^level）
+        # 计算周期并收集
         periods_sub = (T_sub // top_list_sub) * (2 ** level)
         all_periods.extend(periods_sub.cpu().numpy().tolist())
-
-        # 记录子带振幅（用于权重计算）
-        sub_amps = amp_sub[:, top_list_sub]  # [B, k]
+        # 收集振幅
+        sub_amps = amp_sub[:, top_list_sub]
         all_amps.append(sub_amps)
 
-    # 融合周期（取频次最高的top-k）
+    # 融合周期（原逻辑不变）
     unique_periods, counts = torch.unique(torch.tensor(all_periods), return_counts=True)
     if len(unique_periods) < k:
-        # 候选周期不足时，用序列长度一半填充
         pad_num = k - len(unique_periods)
         pad_periods = torch.tensor([T//2]*pad_num, device=unique_periods.device)
         unique_periods = torch.cat([unique_periods, pad_periods])
@@ -80,9 +78,9 @@ def WPT_for_Period(x, k=2, level=2, wave='db4'):
     _, top_k_idx = torch.topk(counts, k)
     top_periods = unique_periods[top_k_idx].int().cpu().numpy()
 
-    # 计算周期权重（子带振幅平均）
-    all_amps = torch.cat(all_amps, dim=1)  # [B, 4k]
-    period_weights = all_amps.mean(dim=1, keepdim=True).repeat(1, k)  # [B, k]
+    # 计算权重（原逻辑不变）
+    all_amps = torch.cat(all_amps, dim=1)
+    period_weights = all_amps.mean(dim=1, keepdim=True).repeat(1, k)
 
     return top_periods, period_weights
 
@@ -93,9 +91,9 @@ class TimesBlock(nn.Module):
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.k = configs.top_k
-        # 小波包开关（默认关闭，兼容原版）
-        self.use_wpt = True  # True启用WPT，False用原版FFT
-        self.wpt_level = 2  # 固定2级分解，无需修改
+        # 已开启WPT（无需修改）
+        self.use_wpt = True  # 现在默认开启，符合你的需求
+        self.wpt_level = 2
         # parameter-efficient design
         self.conv = nn.Sequential(
             Inception_Block_V1(configs.d_model, configs.d_ff,
@@ -107,7 +105,7 @@ class TimesBlock(nn.Module):
 
     def forward(self, x):
         B, T, N = x.size()
-        # 选择周期检测方式（模块化切换）
+        # 调用修正后的WPT函数（无修改）
         if self.use_wpt:
             period_list, period_weight = WPT_for_Period(x, self.k, self.wpt_level)
         else:
@@ -279,13 +277,10 @@ class Model(nn.Module):
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
             return dec_out[:, -self.pred_len:, :]  # [B, L, D]
         if self.task_name == 'imputation':
-            dec_out = self.imputation(
+            return self.imputation(
                 x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
-            return dec_out  # [B, L, D]
         if self.task_name == 'anomaly_detection':
-            dec_out = self.anomaly_detection(x_enc)
-            return dec_out  # [B, L, D]
+            return self.anomaly_detection(x_enc)
         if self.task_name == 'classification':
-            dec_out = self.classification(x_enc, x_mark_enc)
-            return dec_out  # [B, N]
+            return self.classification(x_enc, x_mark_enc)
         return None
