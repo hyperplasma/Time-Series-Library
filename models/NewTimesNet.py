@@ -252,15 +252,17 @@ class Model(nn.Module):
                 default_residual_weight = 1.0
                 mode = "High-dimensional"
             
-            # 命令行参数覆盖（优先级高）
-            inv_n_heads = getattr(configs, 'inv_n_heads', default_n_heads)
-            inv_layers = getattr(configs, 'inv_layers', default_layers)
-            inv_residual_weight = getattr(configs, 'inv_residual_weight', default_residual_weight)
+            # 命令行参数覆盖（关键修复：使用 or 运算符处理None）
+            inv_n_heads = getattr(configs, 'inv_n_heads', None) or default_n_heads
+            inv_layers = getattr(configs, 'inv_layers', None) or default_layers
+            inv_residual_weight = getattr(configs, 'inv_residual_weight', None)
+            if inv_residual_weight is None:
+                inv_residual_weight = default_residual_weight
             
             # 打印配置信息
             is_default = (inv_n_heads == default_n_heads and 
                          inv_layers == default_layers and 
-                         inv_residual_weight == default_residual_weight)
+                         abs(inv_residual_weight - default_residual_weight) < 0.01)
             if is_default:
                 print(f">>> [Core] {mode} mode auto-configured for {configs.enc_in} variables")
             else:
