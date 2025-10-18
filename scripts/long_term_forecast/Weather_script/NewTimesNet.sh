@@ -25,9 +25,6 @@ python -u run.py \
   --n_heads 4 \
   --train_epochs 10 \
   --use_revin 0 \
-  --use_channel_attn 1 \
-  --channel_attn_type wave \
-  --wave_window_size 3 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2
@@ -57,9 +54,6 @@ python -u run.py \
   --n_heads 16 \
   --train_epochs 10 \
   --use_revin 0 \
-  --use_channel_attn 1 \
-  --channel_attn_type 'wave' \
-  --wave_window_size 3 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2
@@ -90,9 +84,6 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 10 \
   --use_revin 0 \
-  --use_channel_attn 1 \
-  --channel_attn_type 'wave' \
-  --wave_window_size 3 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2
@@ -123,9 +114,6 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 10 \
   --use_revin 0 \
-  --use_channel_attn 1 \
-  --channel_attn_type 'wave' \
-  --wave_window_size 3 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2

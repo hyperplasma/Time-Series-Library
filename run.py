@@ -140,11 +140,13 @@ if __name__ == '__main__':
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
     
-    # NewTimesNet
+    # NewTimesNet exp
     parser.add_argument('--use_revin', type=int, default=1)
+    # - Channel Attn (WAVE)
     parser.add_argument('--use_channel_attn', type=int, default=1)
     parser.add_argument('--channel_attn_type', type=str, default='wave')
     parser.add_argument('--wave_window_size', type=int, default=3)
+    # - Inverted Decoder
     parser.add_argument('--use_inverted_decoder', type=int, default=1)
     parser.add_argument('--inv_n_heads', type=int, default=4)
     parser.add_argument('--inv_layers', type=int, default=2)
