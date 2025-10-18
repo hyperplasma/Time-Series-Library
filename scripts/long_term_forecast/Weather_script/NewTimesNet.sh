@@ -25,7 +25,8 @@ python -u run.py \
   --n_heads 4 \
   --train_epochs 3 \
   --use_revin 0 \
-  --use_channel_attn 1
+  --use_channel_attn 1 \
+  --channel_attn_type 'eca'
 
 
 
@@ -52,7 +53,10 @@ python -u run.py \
   --n_heads 16 \
   --train_epochs 3 \
   --use_revin 0 \
-  --use_channel_attn 1
+  --use_channel_attn 1 \
+  --channel_attn_type 'eca'
+
+
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -78,7 +82,10 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 3 \
   --use_revin 0 \
-  --use_channel_attn 1
+  --use_channel_attn 1 \
+  --channel_attn_type 'eca'
+
+
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -104,4 +111,5 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 3 \
   --use_revin 0 \
-  --use_channel_attn 1
+  --use_channel_attn 1 \
+  --channel_attn_type 'eca'

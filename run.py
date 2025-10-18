@@ -143,6 +143,7 @@ if __name__ == '__main__':
     # NewTimesNet
     parser.add_argument('--use_revin', type=int, default=1, help='whether to use RevIN normalization')
     parser.add_argument('--use_channel_attn', type=int, default=1, help='whether to use channel attention')
+    parser.add_argument('--channel_attn_type', type=str, default='eca', help='type of channel attention: eca or cbam')
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:

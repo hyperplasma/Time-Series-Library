@@ -3,6 +3,7 @@ from torch import nn
 from layers.Transformer_EncDec import Encoder, EncoderLayer
 from layers.SelfAttention_Family import FullAttention, AttentionLayer
 from layers.Embed import PatchEmbedding
+import math
 
 
 class RevIN(nn.Module):
@@ -58,27 +59,79 @@ class Transpose(nn.Module):
         else: return x.transpose(*self.dims)
 
 
-class ChannelAttention(nn.Module):
+class ECAAttention(nn.Module):
     """
-    轻量级跨通道注意力
+    ECA (Efficient Channel Attention) 模块
+    论文: ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks
+    
+    核心优势：
+    1. 无降维，避免信息损失
+    2. 局部跨通道交互（1D卷积）
+    3. 自适应卷积核大小
     """
-    def __init__(self, num_channels, reduction=4):
-        super().__init__()
+    def __init__(self, num_channels, gamma=2, b=1):
+        super(ECAAttention, self).__init__()
         self.num_channels = num_channels
+        
+        # 自适应计算卷积核大小 k
+        # 根据通道数C，使用公式: k = |log2(C)/gamma + b/gamma|_odd
+        t = int(abs((math.log(num_channels, 2) + b) / gamma))
+        k = t if t % 2 else t + 1  # 确保k是奇数
+        
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(num_channels, max(num_channels // reduction, 1), bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(max(num_channels // reduction, 1), num_channels, bias=False),
-            nn.Sigmoid()
-        )
+        # 1D卷积，捕捉k个相邻通道的关系
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        
+        print(f">>> ECA kernel size: {k} for {num_channels} channels")
 
     def forward(self, x):
         # x: [bs x nvars x d_model x patch_num]
         b, c, d, p = x.size()
-        y = self.avg_pool(x.view(b, c, -1)).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
+        
+        # 全局平均池化: [B, C, D, P] -> [B, C, 1]
+        y = self.avg_pool(x.view(b, c, -1))  # [B, C, 1]
+        
+        # 1D卷积捕捉局部跨通道交互
+        y = self.conv(y.transpose(-1, -2)).transpose(-1, -2)  # [B, C, 1]
+        
+        # Sigmoid激活
+        y = self.sigmoid(y).view(b, c, 1, 1)  # [B, C, 1, 1]
+        
+        # 广播相乘
         return x * y.expand_as(x)
+
+
+class CBAMChannelAttention(nn.Module):
+    """
+    CBAM的通道注意力部分（作为备选）
+    同时使用avg pool和max pool，信息更丰富
+    """
+    def __init__(self, num_channels, reduction=4):
+        super(CBAMChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv1d(num_channels, max(num_channels // reduction, 1), 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(max(num_channels // reduction, 1), num_channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: [bs x nvars x d_model x patch_num]
+        b, c, d, p = x.size()
+        x_reshape = x.view(b, c, -1)  # [B, C, D*P]
+        
+        # 平均池化和最大池化
+        avg_out = self.fc(self.avg_pool(x_reshape).unsqueeze(-1)).squeeze(-1)
+        max_out = self.fc(self.max_pool(x_reshape).unsqueeze(-1)).squeeze(-1)
+        
+        # 融合两种池化结果
+        out = self.sigmoid(avg_out + max_out).view(b, c, 1, 1)
+        
+        return x * out.expand_as(x)
 
 
 class FlattenHead(nn.Module):
@@ -100,9 +153,10 @@ class Model(nn.Module):
     """
     Enhanced PatchTST with:
     1. RevIN normalization (可开关)
-    2. Channel-wise Attention (可开关)
+    2. ECA Attention (更先进的通道注意力，可开关)
     
     可通过configs.use_revin和configs.use_channel_attn控制
+    可通过configs.channel_attn_type选择注意力类型: 'eca' or 'cbam'
     """
 
     def __init__(self, configs, patch_len=16, stride=8):
@@ -113,7 +167,7 @@ class Model(nn.Module):
         padding = stride
 
         # RevIN（可开关）
-        self.use_revin = getattr(configs, 'use_revin', True)  # 默认开启
+        self.use_revin = getattr(configs, 'use_revin', True)
         if self.use_revin:
             self.revin = RevIN(configs.enc_in, affine=True)
             print(f">>> Using RevIN normalization")
@@ -140,11 +194,18 @@ class Model(nn.Module):
             norm_layer=nn.Sequential(Transpose(1,2), nn.BatchNorm1d(configs.d_model), Transpose(1,2))
         )
 
-        # Channel Attention（可开关）
-        self.use_channel_attn = getattr(configs, 'use_channel_attn', True)  # 默认开启
+        # Channel Attention（可开关，可选类型）
+        self.use_channel_attn = getattr(configs, 'use_channel_attn', True)
         if self.use_channel_attn:
-            self.channel_attention = ChannelAttention(configs.enc_in, reduction=4)
-            print(f">>> Using Channel Attention")
+            attn_type = getattr(configs, 'channel_attn_type', 'eca')  # 默认使用ECA
+            if attn_type == 'eca':
+                self.channel_attention = ECAAttention(configs.enc_in)
+                print(f">>> Using ECA Channel Attention")
+            elif attn_type == 'cbam':
+                self.channel_attention = CBAMChannelAttention(configs.enc_in, reduction=4)
+                print(f">>> Using CBAM Channel Attention")
+            else:
+                raise ValueError(f"Unknown channel attention type: {attn_type}")
         else:
             print(f">>> Not using Channel Attention")
 
@@ -166,10 +227,8 @@ class Model(nn.Module):
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # Normalization
         if self.use_revin:
-            # RevIN normalization
             x_enc = self.revin(x_enc, 'norm')
         else:
-            # Standard normalization (from original PatchTST)
             means = x_enc.mean(1, keepdim=True).detach()
             x_enc = x_enc - means
             stdev = torch.sqrt(
@@ -198,10 +257,8 @@ class Model(nn.Module):
 
         # De-Normalization
         if self.use_revin:
-            # RevIN denormalization
             dec_out = self.revin(dec_out, 'denorm')
         else:
-            # Standard denormalization
             dec_out = dec_out * \
                       (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
             dec_out = dec_out + \
