@@ -23,7 +23,7 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 4 \
-  --train_epochs 3 \
+  --train_epochs 10 \
   --use_revin 0 \
   --use_channel_attn 1 \
   --channel_attn_type 'wave' \
@@ -52,7 +52,7 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 16 \
-  --train_epochs 3 \
+  --train_epochs 10 \
   --use_revin 0 \
   --use_channel_attn 1 \
   --channel_attn_type 'wave' \
@@ -82,7 +82,7 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --train_epochs 3 \
+  --train_epochs 10 \
   --use_revin 0 \
   --use_channel_attn 1 \
   --channel_attn_type 'wave' \
@@ -112,7 +112,7 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --train_epochs 3 \
+  --train_epochs 10 \
   --use_revin 0 \
   --use_channel_attn 1 \
   --channel_attn_type 'wave' \
