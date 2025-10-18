@@ -141,15 +141,21 @@ if __name__ == '__main__':
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
     
     # NewTimesNet exp
-    parser.add_argument('--use_revin', type=int, default=1)
+    parser.add_argument('--use_revin', type=int, default=0,
+                        help='whether to use RevIN (default: 0)')
     # - Channel Attn (WAVE)
     parser.add_argument('--use_channel_attn', type=int, default=1)
     parser.add_argument('--channel_attn_type', type=str, default='wave')
     parser.add_argument('--wave_window_size', type=int, default=3)
-    # - Inverted Decoder
-    parser.add_argument('--use_inverted_decoder', type=int, default=1)
-    parser.add_argument('--inv_n_heads', type=int, default=4)
-    parser.add_argument('--inv_layers', type=int, default=2)
+    # - InvDec
+    parser.add_argument('--use_inverted_decoder', type=int, default=1, 
+                        help='whether to use inverted decoder (default: 1)')
+    parser.add_argument('--inv_n_heads', type=int, default=None, 
+                        help='num of heads in inverted decoder (auto if not set)')
+    parser.add_argument('--inv_layers', type=int, default=None, 
+                        help='num of inverted decoder layers (auto if not set)')
+    parser.add_argument('--inv_residual_weight', type=float, default=None, 
+                        help='residual weight for inverted decoder (auto if not set)')
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:

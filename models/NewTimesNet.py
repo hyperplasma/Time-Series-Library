@@ -113,22 +113,19 @@ class InvertedDecoderLayer(nn.Module):
 
 class InvertedDecoder(nn.Module):
     """
-    Inverted Decoder模块 - 核心创新
+    自适应Inverted Decoder模块
     
-    设计思想：
-    - Encoder: 在时间维度建模，捕捉temporal patterns
-    - Decoder: 在变量维度建模，捕捉variate dependencies
-    - 双重视角形成正交互补，增强多变量时序的表达能力
-    
-    关键特性：
-    1. 变量级建模：每个变量作为一个token
-    2. 可学习的变量embedding：编码变量的先验信息
-    3. 残差连接：融合时间和变量两个视角
+    特性：
+    1. 自动根据变量数调整配置（可被命令行参数覆盖）
+    2. 支持可调节的残差权重（用于不同数据集的适配）
+    3. 双重视角建模：变量维度attention + 与时间视角的融合
     """
-    def __init__(self, num_vars, d_model, n_heads=4, d_ff=None, num_layers=2, dropout=0.1):
+    def __init__(self, num_vars, d_model, n_heads=4, d_ff=None, num_layers=2, 
+                 dropout=0.1, residual_weight=1.0):
         super(InvertedDecoder, self).__init__()
         self.num_vars = num_vars
         self.d_model = d_model
+        self.residual_weight = residual_weight
         d_ff = d_ff or d_model * 4
         
         # 可学习的变量embedding（编码变量的先验信息）
@@ -143,7 +140,8 @@ class InvertedDecoder(nn.Module):
         # Output Projection
         self.output_proj = nn.Linear(d_model, d_model)
         
-        print(f">>> Inverted Decoder: {num_layers} layers, {n_heads} heads, {num_vars} variables")
+        print(f">>> InvDec Config: {num_layers} layers, {n_heads} heads, "
+              f"{num_vars} vars, residual_weight={residual_weight:.2f}")
 
     def forward(self, x):
         """
@@ -168,8 +166,8 @@ class InvertedDecoder(nn.Module):
         # 广播回原始形状
         x_pooled = x_pooled.unsqueeze(2).expand(-1, -1, P, -1)  # [B, V, P, D]
         
-        # 残差连接：融合时间和变量两个视角的信息
-        output = x + x_pooled
+        # 自适应残差连接：融合时间和变量两个视角
+        output = x + self.residual_weight * x_pooled
         
         return output
 
@@ -191,15 +189,17 @@ class FlattenHead(nn.Module):
 
 class Model(nn.Module):
     """
-    PatchTST with Inverted Decoder
+    InvDec: Inverted Decoder for Time Series Forecasting
     
     核心创新：Hybrid Inverted Architecture
     - Encoder: 在时间维度建模（temporal patterns）
-    - Decoder: 在变量维度建模（variate dependencies）
+    - InvDec: 在变量维度建模（variate dependencies）
     - 双重视角形成互补，增强多变量时序建模能力
     
-    可选模块：
-    - RevIN: 默认关闭，可通过--use_revin 1开启
+    自适应特性：
+    - 低维数据（≤10变量）：轻量级配置（1层，2头，权重0.3）
+    - 高维数据（>10变量）：完整配置（2层，4头，权重1.0）
+    - 支持命令行手动覆盖所有参数
     """
 
     def __init__(self, configs, patch_len=16, stride=8):
@@ -240,17 +240,41 @@ class Model(nn.Module):
         # Inverted Decoder (变量维度建模) - 核心创新
         self.use_inverted_decoder = getattr(configs, 'use_inverted_decoder', True)
         if self.use_inverted_decoder:
-            inv_n_heads = getattr(configs, 'inv_n_heads', 4)
-            inv_layers = getattr(configs, 'inv_layers', 2)
+            # 自动适配策略（优先级低）
+            if configs.enc_in <= 10:
+                default_n_heads = 2
+                default_layers = 1
+                default_residual_weight = 0.3
+                mode = "Low-dimensional"
+            else:
+                default_n_heads = 4
+                default_layers = 2
+                default_residual_weight = 1.0
+                mode = "High-dimensional"
+            
+            # 命令行参数覆盖（优先级高）
+            inv_n_heads = getattr(configs, 'inv_n_heads', default_n_heads)
+            inv_layers = getattr(configs, 'inv_layers', default_layers)
+            inv_residual_weight = getattr(configs, 'inv_residual_weight', default_residual_weight)
+            
+            # 打印配置信息
+            is_default = (inv_n_heads == default_n_heads and 
+                         inv_layers == default_layers and 
+                         inv_residual_weight == default_residual_weight)
+            if is_default:
+                print(f">>> [Core] {mode} mode auto-configured for {configs.enc_in} variables")
+            else:
+                print(f">>> [Core] Manual configuration for {configs.enc_in} variables")
+            
             self.inverted_decoder = InvertedDecoder(
                 num_vars=configs.enc_in,
                 d_model=configs.d_model,
                 n_heads=inv_n_heads,
                 d_ff=configs.d_ff,
                 num_layers=inv_layers,
-                dropout=configs.dropout
+                dropout=configs.dropout,
+                residual_weight=inv_residual_weight
             )
-            print(f">>> [Core] Using Inverted Decoder Architecture")
         else:
             print(f">>> Baseline PatchTST (no Inverted Decoder)")
 
