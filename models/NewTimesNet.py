@@ -113,12 +113,13 @@ class InvertedDecoderLayer(nn.Module):
 
 class InvertedDecoder(nn.Module):
     """
-    自适应Inverted Decoder模块
+    InvDec: Inverted Decoder模块
+    专为高维多变量时序预测设计（推荐变量数>=20）
     
-    特性：
-    1. 自动根据变量数调整配置（可被命令行参数覆盖）
-    2. 支持可调节的残差权重（用于不同数据集的适配）
-    3. 双重视角建模：变量维度attention + 与时间视角的融合
+    核心思想：
+    - 在变量维度应用Self-Attention
+    - 捕捉跨变量的复杂依赖关系
+    - 与Encoder的时间维度建模形成互补
     """
     def __init__(self, num_vars, d_model, n_heads=4, d_ff=None, num_layers=2, 
                  dropout=0.1, residual_weight=1.0):
@@ -140,7 +141,7 @@ class InvertedDecoder(nn.Module):
         # Output Projection
         self.output_proj = nn.Linear(d_model, d_model)
         
-        print(f">>> InvDec Config: {num_layers} layers, {n_heads} heads, "
+        print(f">>> InvDec: {num_layers} layers, {n_heads} heads, "
               f"{num_vars} vars, residual_weight={residual_weight:.2f}")
 
     def forward(self, x):
@@ -189,17 +190,17 @@ class FlattenHead(nn.Module):
 
 class Model(nn.Module):
     """
-    InvDec: Inverted Decoder for Time Series Forecasting
+    InvDec: Inverted Decoder for High-Dimensional Multi-variate Time Series Forecasting
     
     核心创新：Hybrid Inverted Architecture
     - Encoder: 在时间维度建模（temporal patterns）
     - InvDec: 在变量维度建模（variate dependencies）
-    - 双重视角形成互补，增强多变量时序建模能力
+    - 双重视角形成互补，特别适用于高维多变量场景（推荐>=20变量）
     
-    自适应特性：
-    - 低维数据（≤10变量）：轻量级配置（1层，2头，权重0.3）
-    - 高维数据（>10变量）：完整配置（2层，4头，权重1.0）
-    - 支持命令行手动覆盖所有参数
+    参数配置：
+    - 统一使用完整配置（2层，4头，权重1.0）
+    - 支持命令行手动覆盖
+    - 低维数据会显示警告但仍可使用
     """
 
     def __init__(self, configs, patch_len=16, stride=8):
@@ -240,33 +241,19 @@ class Model(nn.Module):
         # Inverted Decoder (变量维度建模) - 核心创新
         self.use_inverted_decoder = getattr(configs, 'use_inverted_decoder', True)
         if self.use_inverted_decoder:
-            # 自动适配策略（优先级低）
-            if configs.enc_in <= 10:
-                default_n_heads = 2
-                default_layers = 1
-                default_residual_weight = 0.3
-                mode = "Low-dimensional"
-            else:
-                default_n_heads = 4
-                default_layers = 2
-                default_residual_weight = 1.0
-                mode = "High-dimensional"
-            
-            # 命令行参数覆盖（关键修复：使用 or 运算符处理None）
-            inv_n_heads = getattr(configs, 'inv_n_heads', None) or default_n_heads
-            inv_layers = getattr(configs, 'inv_layers', None) or default_layers
+            # 统一使用完整默认配置
+            inv_n_heads = getattr(configs, 'inv_n_heads', None) or 4
+            inv_layers = getattr(configs, 'inv_layers', None) or 2
             inv_residual_weight = getattr(configs, 'inv_residual_weight', None)
             if inv_residual_weight is None:
-                inv_residual_weight = default_residual_weight
+                inv_residual_weight = 1.0
             
-            # 打印配置信息
-            is_default = (inv_n_heads == default_n_heads and 
-                         inv_layers == default_layers and 
-                         abs(inv_residual_weight - default_residual_weight) < 0.01)
-            if is_default:
-                print(f">>> [Core] {mode} mode auto-configured for {configs.enc_in} variables")
+            # 低维数据警告
+            if configs.enc_in < 15:
+                print(f">>> [Warning] InvDec is optimized for high-dimensional data (>=20 vars). "
+                      f"Current: {configs.enc_in} vars. Consider using baseline for better performance.")
             else:
-                print(f">>> [Core] Manual configuration for {configs.enc_in} variables")
+                print(f">>> [Core] InvDec enabled for {configs.enc_in} variables (high-dimensional mode)")
             
             self.inverted_decoder = InvertedDecoder(
                 num_vars=configs.enc_in,
@@ -298,10 +285,8 @@ class Model(nn.Module):
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # Normalization
         if self.use_revin:
-            # RevIN normalization
             x_enc = self.revin(x_enc, 'norm')
         else:
-            # Standard normalization
             means = x_enc.mean(1, keepdim=True).detach()
             x_enc = x_enc - means
             stdev = torch.sqrt(
@@ -332,10 +317,8 @@ class Model(nn.Module):
 
         # De-Normalization
         if self.use_revin:
-            # RevIN denormalization
             dec_out = self.revin(dec_out, 'denorm')
         else:
-            # Standard denormalization
             dec_out = dec_out * \
                       (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
             dec_out = dec_out + \
