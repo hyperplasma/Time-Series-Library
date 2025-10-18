@@ -99,10 +99,10 @@ class FlattenHead(nn.Module):
 class Model(nn.Module):
     """
     Enhanced PatchTST with:
-    1. RevIN normalization
-    2. Channel-wise Attention
+    1. RevIN normalization (可开关)
+    2. Channel-wise Attention (可开关)
     
-    简化版：去掉多尺度patch，专注于RevIN和通道注意力
+    可通过configs.use_revin和configs.use_channel_attn控制
     """
 
     def __init__(self, configs, patch_len=16, stride=8):
@@ -112,8 +112,13 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         padding = stride
 
-        # RevIN（核心改进1）
-        self.revin = RevIN(configs.enc_in, affine=True)
+        # RevIN（可开关）
+        self.use_revin = getattr(configs, 'use_revin', True)  # 默认开启
+        if self.use_revin:
+            self.revin = RevIN(configs.enc_in, affine=True)
+            print(f">>> Using RevIN normalization")
+        else:
+            print(f">>> Using standard normalization")
 
         # 标准Patch嵌入
         self.patch_embedding = PatchEmbedding(
@@ -135,8 +140,13 @@ class Model(nn.Module):
             norm_layer=nn.Sequential(Transpose(1,2), nn.BatchNorm1d(configs.d_model), Transpose(1,2))
         )
 
-        # Channel Attention（核心改进2）
-        self.channel_attention = ChannelAttention(configs.enc_in, reduction=4)
+        # Channel Attention（可开关）
+        self.use_channel_attn = getattr(configs, 'use_channel_attn', True)  # 默认开启
+        if self.use_channel_attn:
+            self.channel_attention = ChannelAttention(configs.enc_in, reduction=4)
+            print(f">>> Using Channel Attention")
+        else:
+            print(f">>> Not using Channel Attention")
 
         # Prediction Head
         self.head_nf = configs.d_model * int((configs.seq_len - patch_len) / stride + 2)
@@ -154,8 +164,17 @@ class Model(nn.Module):
                 self.head_nf * configs.enc_in, configs.num_class)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # RevIN normalization
-        x_enc = self.revin(x_enc, 'norm')
+        # Normalization
+        if self.use_revin:
+            # RevIN normalization
+            x_enc = self.revin(x_enc, 'norm')
+        else:
+            # Standard normalization (from original PatchTST)
+            means = x_enc.mean(1, keepdim=True).detach()
+            x_enc = x_enc - means
+            stdev = torch.sqrt(
+                torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+            x_enc /= stdev
 
         # Patching and embedding
         x_enc = x_enc.permute(0, 2, 1)
@@ -170,14 +189,23 @@ class Model(nn.Module):
         enc_out = enc_out.permute(0, 1, 3, 2)
 
         # Channel Attention
-        enc_out = self.channel_attention(enc_out)
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
 
         # Decoder
         dec_out = self.head(enc_out)
         dec_out = dec_out.permute(0, 2, 1)
 
-        # RevIN denormalization
-        dec_out = self.revin(dec_out, 'denorm')
+        # De-Normalization
+        if self.use_revin:
+            # RevIN denormalization
+            dec_out = self.revin(dec_out, 'denorm')
+        else:
+            # Standard denormalization
+            dec_out = dec_out * \
+                      (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
+            dec_out = dec_out + \
+                      (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
         
         return dec_out
 
@@ -198,7 +226,8 @@ class Model(nn.Module):
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         enc_out = enc_out.permute(0, 1, 3, 2)
 
-        enc_out = self.channel_attention(enc_out)
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
 
         dec_out = self.head(enc_out)
         dec_out = dec_out.permute(0, 2, 1)
@@ -208,7 +237,14 @@ class Model(nn.Module):
         return dec_out
 
     def anomaly_detection(self, x_enc):
-        x_enc = self.revin(x_enc, 'norm')
+        if self.use_revin:
+            x_enc = self.revin(x_enc, 'norm')
+        else:
+            means = x_enc.mean(1, keepdim=True).detach()
+            x_enc = x_enc - means
+            stdev = torch.sqrt(
+                torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+            x_enc /= stdev
 
         x_enc = x_enc.permute(0, 2, 1)
         enc_out, n_vars = self.patch_embedding(x_enc)
@@ -217,16 +253,30 @@ class Model(nn.Module):
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         enc_out = enc_out.permute(0, 1, 3, 2)
 
-        enc_out = self.channel_attention(enc_out)
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
 
         dec_out = self.head(enc_out)
         dec_out = dec_out.permute(0, 2, 1)
 
-        dec_out = self.revin(dec_out, 'denorm')
+        if self.use_revin:
+            dec_out = self.revin(dec_out, 'denorm')
+        else:
+            dec_out = dec_out * \
+                      (stdev[:, 0, :].unsqueeze(1).repeat(1, self.seq_len, 1))
+            dec_out = dec_out + \
+                      (means[:, 0, :].unsqueeze(1).repeat(1, self.seq_len, 1))
         return dec_out
 
     def classification(self, x_enc, x_mark_enc):
-        x_enc = self.revin(x_enc, 'norm')
+        if self.use_revin:
+            x_enc = self.revin(x_enc, 'norm')
+        else:
+            means = x_enc.mean(1, keepdim=True).detach()
+            x_enc = x_enc - means
+            stdev = torch.sqrt(
+                torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+            x_enc /= stdev
 
         x_enc = x_enc.permute(0, 2, 1)
         enc_out, n_vars = self.patch_embedding(x_enc)
@@ -235,7 +285,8 @@ class Model(nn.Module):
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         enc_out = enc_out.permute(0, 1, 3, 2)
 
-        enc_out = self.channel_attention(enc_out)
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
 
         output = self.flatten(enc_out)
         output = self.dropout(output)

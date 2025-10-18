@@ -23,7 +23,11 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 4 \
-  --train_epochs 3
+  --train_epochs 3 \
+  --use_revin 0 \
+  --use_channel_attn 1
+
+
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -46,7 +50,9 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 16 \
-  --train_epochs 3
+  --train_epochs 3 \
+  --use_revin 0 \
+  --use_channel_attn 1
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -70,7 +76,9 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --train_epochs 3
+  --train_epochs 3 \
+  --use_revin 0 \
+  --use_channel_attn 1
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -94,4 +102,6 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --train_epochs 3
+  --train_epochs 3 \
+  --use_revin 0 \
+  --use_channel_attn 1
