@@ -1,19 +1,8 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.fft
-from layers.Embed import DataEmbedding
-from layers.Conv_Blocks import Inception_Block_V1
-
-
-def FFT_for_Period(x, k=2):
-    xf = torch.fft.rfft(x, dim=1)
-    frequency_list = abs(xf).mean(0).mean(-1)
-    frequency_list[0] = 0
-    _, top_list = torch.topk(frequency_list, k)
-    top_list = top_list.detach().cpu().numpy()
-    period = x.shape[1] // top_list
-    return period, abs(xf).mean(-1)[:, top_list]
+from torch import nn
+from layers.Transformer_EncDec import Encoder, EncoderLayer
+from layers.SelfAttention_Family import FullAttention, AttentionLayer
+from layers.Embed import PatchEmbedding
 
 
 class RevIN(nn.Module):
@@ -60,224 +49,267 @@ class RevIN(nn.Module):
         return x
 
 
-class SeriesDecomp(nn.Module):
-    """
-    核心创新1：可学习的时序分解（来自Autoformer）
-    使用移动平均提取趋势，残差作为季节性
-    """
-    def __init__(self, kernel_size):
-        super(SeriesDecomp, self).__init__()
-        self.kernel_size = kernel_size
-        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
-
+class Transpose(nn.Module):
+    def __init__(self, *dims, contiguous=False): 
+        super().__init__()
+        self.dims, self.contiguous = dims, contiguous
     def forward(self, x):
-        # x: [B, T, C]
-        # padding on both sides
-        front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
-        end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
-        x_padded = torch.cat([front, x, end], dim=1)
-        
-        # moving average
-        x_padded = x_padded.permute(0, 2, 1)  # [B, C, T]
-        trend = self.avg(x_padded).permute(0, 2, 1)  # [B, T, C]
-        
-        # seasonal = original - trend
-        seasonal = x - trend
-        
-        return seasonal, trend
+        if self.contiguous: return x.transpose(*self.dims).contiguous()
+        else: return x.transpose(*self.dims)
 
 
-class TimesBlock(nn.Module):
-    """原版TimesBlock"""
-    def __init__(self, configs):
-        super(TimesBlock, self).__init__()
-        self.seq_len = configs.seq_len
-        self.pred_len = configs.pred_len
-        self.k = configs.top_k
-        
-        self.conv = nn.Sequential(
-            Inception_Block_V1(configs.d_model, configs.d_ff,
-                               num_kernels=configs.num_kernels),
-            nn.GELU(),
-            Inception_Block_V1(configs.d_ff, configs.d_model,
-                               num_kernels=configs.num_kernels)
+class ChannelAttention(nn.Module):
+    """
+    核心创新1：轻量级跨通道注意力
+    在保持Channel Independence优势的同时，允许有限的通道间信息交换
+    """
+    def __init__(self, num_channels, reduction=4):
+        super().__init__()
+        self.num_channels = num_channels
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(num_channels, num_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(num_channels // reduction, num_channels, bias=False),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
-        B, T, N = x.size()
-        period_list, period_weight = FFT_for_Period(x, self.k)
-
-        res = []
-        for i in range(self.k):
-            period = period_list[i]
-            if (self.seq_len + self.pred_len) % period != 0:
-                length = (((self.seq_len + self.pred_len) // period) + 1) * period
-                padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
-                out = torch.cat([x, padding], dim=1)
-            else:
-                length = (self.seq_len + self.pred_len)
-                out = x
-            out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
-            out = self.conv(out)
-            out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
-            res.append(out[:, :(self.seq_len + self.pred_len), :])
-        res = torch.stack(res, dim=-1)
-        period_weight = F.softmax(period_weight, dim=1)
-        period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
-        res = torch.sum(res * period_weight, -1)
-        res = res + x
-        return res
+        # x: [bs x nvars x d_model x patch_num]
+        b, c, d, p = x.size()
+        # 在patch维度上池化
+        y = self.avg_pool(x.view(b, c, -1)).view(b, c)  # [bs x nvars]
+        # 学习通道权重
+        y = self.fc(y).view(b, c, 1, 1)  # [bs x nvars x 1 x 1]
+        # 广播相乘
+        return x * y.expand_as(x)
 
 
-class DecompTimesBlock(nn.Module):
+class MultiScalePatchEmbedding(nn.Module):
     """
-    核心创新2：分解增强的TimesBlock
-    分别处理季节性和趋势，然后融合
+    核心创新2：多尺度Patch嵌入
+    使用不同的patch_len捕捉不同时间尺度的模式
     """
-    def __init__(self, configs):
-        super(DecompTimesBlock, self).__init__()
-        # 时序分解
-        self.decomp = SeriesDecomp(kernel_size=25)
+    def __init__(self, d_model, patch_lens=[16, 8, 32], stride=8, padding=8, dropout=0.1):
+        super().__init__()
+        self.patch_lens = patch_lens
+        self.num_scales = len(patch_lens)
         
-        # 季节性处理（使用TimesBlock捕捉周期模式）
-        self.seasonal_block = TimesBlock(configs)
+        # 为每个尺度创建独立的patch embedding
+        self.patch_embeddings = nn.ModuleList([
+            PatchEmbedding(d_model, patch_len, stride, padding, dropout)
+            for patch_len in patch_lens
+        ])
         
-        # 趋势处理（简单的线性层）
-        self.trend_projection = nn.Linear(configs.d_model, configs.d_model)
+        # 尺度融合权重（可学习）
+        self.scale_weights = nn.Parameter(torch.ones(self.num_scales) / self.num_scales)
         
     def forward(self, x):
-        # 分解
-        seasonal, trend = self.decomp(x)
+        # x: [bs, nvars, seq_len]
+        multi_scale_features = []
+        n_vars = None
         
-        # 分别处理
-        seasonal_out = self.seasonal_block(seasonal)
-        trend_out = self.trend_projection(trend)
+        for i, patch_embed in enumerate(self.patch_embeddings):
+            # 每个尺度的patch embedding
+            feat, n_vars = patch_embed(x)  # [bs * nvars, patch_num, d_model]
+            multi_scale_features.append(feat)
         
-        # 融合
-        out = seasonal_out + trend_out
-        return out
+        # 对齐patch数量（填充或截断到最大）
+        max_patches = max([f.shape[1] for f in multi_scale_features])
+        aligned_features = []
+        for feat in multi_scale_features:
+            if feat.shape[1] < max_patches:
+                # 填充
+                padding = torch.zeros(feat.shape[0], max_patches - feat.shape[1], feat.shape[2]).to(feat.device)
+                feat = torch.cat([feat, padding], dim=1)
+            elif feat.shape[1] > max_patches:
+                # 截断
+                feat = feat[:, :max_patches, :]
+            aligned_features.append(feat)
+        
+        # 加权融合多尺度特征
+        scale_weights = torch.softmax(self.scale_weights, dim=0)
+        fused_features = sum([w * f for w, f in zip(scale_weights, aligned_features)])
+        
+        return fused_features, n_vars
+
+
+class FlattenHead(nn.Module):
+    def __init__(self, n_vars, nf, target_window, head_dropout=0):
+        super().__init__()
+        self.n_vars = n_vars
+        self.flatten = nn.Flatten(start_dim=-2)
+        self.linear = nn.Linear(nf, target_window)
+        self.dropout = nn.Dropout(head_dropout)
+
+    def forward(self, x):
+        x = self.flatten(x)
+        x = self.linear(x)
+        x = self.dropout(x)
+        return x
 
 
 class Model(nn.Module):
     """
-    TimesNet + RevIN + Series Decomposition
-    
-    核心改进：
-    1. RevIN标准化（已验证有效）
-    2. 显式的趋势-季节性分解（来自Autoformer）
-    3. 分别建模趋势和季节性
+    Enhanced PatchTST with:
+    1. RevIN normalization (from original PatchTST paper)
+    2. Multi-Scale Patch Embedding (capture different temporal scales)
+    3. Channel-wise Attention (limited cross-channel interaction)
     """
 
-    def __init__(self, configs):
-        super(Model, self).__init__()
-        self.configs = configs
+    def __init__(self, configs, patch_len=16, stride=8):
+        super().__init__()
         self.task_name = configs.task_name
         self.seq_len = configs.seq_len
-        self.label_len = configs.label_len
         self.pred_len = configs.pred_len
-        
+        padding = stride
+
         # RevIN
-        self.revin_layer = RevIN(configs.enc_in, affine=True)
-        
-        # 输入层分解
-        self.decomp_input = SeriesDecomp(kernel_size=25)
-        
-        # 分解增强的TimesBlock
-        self.model = nn.ModuleList([DecompTimesBlock(configs) 
-                                    for _ in range(configs.e_layers)])
-        
-        self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, 
-                                          configs.embed, configs.freq,
-                                          configs.dropout)
-        self.layer = configs.e_layers
-        self.layer_norm = nn.LayerNorm(configs.d_model)
-        
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            self.predict_linear = nn.Linear(self.seq_len, self.pred_len + self.seq_len)
-            self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
-            
-            # 趋势预测分支
-            self.trend_projection = nn.Sequential(
-                nn.Linear(self.seq_len, self.pred_len + self.seq_len),
-                nn.Linear(configs.enc_in, configs.c_out)
+        self.revin = RevIN(configs.enc_in, affine=True)
+
+        # 多尺度Patch嵌入
+        self.use_multi_scale = getattr(configs, 'use_multi_scale', True)
+        if self.use_multi_scale:
+            self.patch_embedding = MultiScalePatchEmbedding(
+                configs.d_model, 
+                patch_lens=[patch_len // 2, patch_len, patch_len * 2],  # [8, 16, 32]
+                stride=stride, 
+                padding=padding, 
+                dropout=configs.dropout
             )
-            
-        if self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
-            self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
-        if self.task_name == 'classification':
-            self.act = F.gelu
+            # 更新head_nf以匹配multi-scale输出
+            max_patch_len = patch_len * 2
+            self.head_nf = configs.d_model * int((configs.seq_len - max_patch_len) / stride + 2)
+        else:
+            self.patch_embedding = PatchEmbedding(
+                configs.d_model, patch_len, stride, padding, configs.dropout)
+            self.head_nf = configs.d_model * int((configs.seq_len - patch_len) / stride + 2)
+
+        # Encoder
+        self.encoder = Encoder(
+            [
+                EncoderLayer(
+                    AttentionLayer(
+                        FullAttention(False, configs.factor, attention_dropout=configs.dropout,
+                                      output_attention=False), configs.d_model, configs.n_heads),
+                    configs.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation
+                ) for l in range(configs.e_layers)
+            ],
+            norm_layer=nn.Sequential(Transpose(1,2), nn.BatchNorm1d(configs.d_model), Transpose(1,2))
+        )
+
+        # Channel Attention
+        self.use_channel_attn = getattr(configs, 'use_channel_attn', True)
+        if self.use_channel_attn:
+            self.channel_attention = ChannelAttention(configs.enc_in, reduction=4)
+
+        # Prediction Head
+        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+            self.head = FlattenHead(configs.enc_in, self.head_nf, configs.pred_len,
+                                    head_dropout=configs.dropout)
+        elif self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
+            self.head = FlattenHead(configs.enc_in, self.head_nf, configs.seq_len,
+                                    head_dropout=configs.dropout)
+        elif self.task_name == 'classification':
+            self.flatten = nn.Flatten(start_dim=-2)
             self.dropout = nn.Dropout(configs.dropout)
-            self.projection = nn.Linear(configs.d_model * configs.seq_len, configs.num_class)
+            self.projection = nn.Linear(
+                self.head_nf * configs.enc_in, configs.num_class)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # RevIN normalization
-        x_enc = self.revin_layer(x_enc, 'norm')
+        x_enc = self.revin(x_enc, 'norm')
+
+        # Patching and embedding
+        x_enc = x_enc.permute(0, 2, 1)
+        enc_out, n_vars = self.patch_embedding(x_enc)
+
+        # Encoder
+        enc_out, attns = self.encoder(enc_out)
         
-        # 输入分解
-        seasonal_init, trend_init = self.decomp_input(x_enc)
-        
-        # 季节性路径（主路径）
-        enc_out = self.enc_embedding(seasonal_init, x_mark_enc)
-        enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(0, 2, 1)
-        
-        for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
-        
-        seasonal_out = self.projection(enc_out)
-        
-        # 趋势路径（辅助路径）
-        trend_out = self.trend_projection[0](trend_init.permute(0, 2, 1)).permute(0, 2, 1)
-        trend_out = self.trend_projection[1](trend_out)
-        
-        # 融合季节性和趋势
-        dec_out = seasonal_out + trend_out
+        # Reshape
+        enc_out = torch.reshape(
+            enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        enc_out = enc_out.permute(0, 1, 3, 2)
+
+        # Channel Attention
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
+
+        # Decoder
+        dec_out = self.head(enc_out)
+        dec_out = dec_out.permute(0, 2, 1)
 
         # RevIN denormalization
-        dec_out = self.revin_layer(dec_out, 'denorm')
+        dec_out = self.revin(dec_out, 'denorm')
         
         return dec_out
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
+        # Use original normalization for imputation
         means = torch.sum(x_enc, dim=1) / torch.sum(mask == 1, dim=1)
         means = means.unsqueeze(1).detach()
         x_enc = x_enc - means
         x_enc = x_enc.masked_fill(mask == 0, 0)
-        stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=1) / torch.sum(mask == 1, dim=1) + 1e-5)
+        stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=1) /
+                           torch.sum(mask == 1, dim=1) + 1e-5)
         stdev = stdev.unsqueeze(1).detach()
-        x_enc = x_enc / stdev
+        x_enc /= stdev
 
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)
-        for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
-        dec_out = self.projection(enc_out)
+        x_enc = x_enc.permute(0, 2, 1)
+        enc_out, n_vars = self.patch_embedding(x_enc)
+        enc_out, attns = self.encoder(enc_out)
+        enc_out = torch.reshape(
+            enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        enc_out = enc_out.permute(0, 1, 3, 2)
 
-        dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
-        dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
+
+        dec_out = self.head(enc_out)
+        dec_out = dec_out.permute(0, 2, 1)
+
+        dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.seq_len, 1))
+        dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.seq_len, 1))
         return dec_out
 
     def anomaly_detection(self, x_enc):
-        means = x_enc.mean(1, keepdim=True).detach()
-        x_enc = x_enc - means
-        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        x_enc = x_enc / stdev
+        x_enc = self.revin(x_enc, 'norm')
 
-        enc_out = self.enc_embedding(x_enc, None)
-        for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
-        dec_out = self.projection(enc_out)
+        x_enc = x_enc.permute(0, 2, 1)
+        enc_out, n_vars = self.patch_embedding(x_enc)
+        enc_out, attns = self.encoder(enc_out)
+        enc_out = torch.reshape(
+            enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        enc_out = enc_out.permute(0, 1, 3, 2)
 
-        dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
-        dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
+
+        dec_out = self.head(enc_out)
+        dec_out = dec_out.permute(0, 2, 1)
+
+        dec_out = self.revin(dec_out, 'denorm')
         return dec_out
 
     def classification(self, x_enc, x_mark_enc):
-        enc_out = self.enc_embedding(x_enc, None)
-        for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
+        x_enc = self.revin(x_enc, 'norm')
 
-        output = self.act(enc_out)
+        x_enc = x_enc.permute(0, 2, 1)
+        enc_out, n_vars = self.patch_embedding(x_enc)
+        enc_out, attns = self.encoder(enc_out)
+        enc_out = torch.reshape(
+            enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        enc_out = enc_out.permute(0, 1, 3, 2)
+
+        if self.use_channel_attn:
+            enc_out = self.channel_attention(enc_out)
+
+        output = self.flatten(enc_out)
         output = self.dropout(output)
-        output = output * x_mark_enc.unsqueeze(-1)
         output = output.reshape(output.shape[0], -1)
         output = self.projection(output)
         return output
@@ -287,7 +319,8 @@ class Model(nn.Module):
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
             return dec_out[:, -self.pred_len:, :]
         if self.task_name == 'imputation':
-            dec_out = self.imputation(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
+            dec_out = self.imputation(
+                x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
             return dec_out
         if self.task_name == 'anomaly_detection':
             dec_out = self.anomaly_detection(x_enc)

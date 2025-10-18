@@ -20,11 +20,10 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
   --des 'Exp' \
-  --itr 1
+  --itr 1 \
+  --n_heads 4 \
+  --train_epochs 3
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -44,13 +43,10 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
   --des 'Exp' \
   --itr 1 \
-  --train_epochs 1
-
+  --n_heads 16 \
+  --train_epochs 3
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -70,11 +66,11 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
   --des 'Exp' \
-  --itr 1
+  --itr 1 \
+  --n_heads 4 \
+  --batch_size 128 \
+  --train_epochs 3
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -94,9 +90,8 @@ python -u run.py \
   --enc_in 21 \
   --dec_in 21 \
   --c_out 21 \
-  --d_model 32 \
-  --d_ff 32 \
-  --top_k 5 \
   --des 'Exp' \
   --itr 1 \
-  --train_epochs 1
+  --n_heads 4 \
+  --batch_size 128 \
+  --train_epochs 3
