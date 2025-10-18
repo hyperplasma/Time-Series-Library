@@ -60,97 +60,169 @@ class Transpose(nn.Module):
 
 
 class WAVEChannelAttention(nn.Module):
-    """
-    WAVE: Weighted Autoregressive Varying Gate Attention (2025年最新)
-    论文: WAVE: Weighted Autoregressive Varying Gate for Time Series Forecasting
-    arxiv: 2410.03159v3 (更新于2025年2月)
-    
-    核心创新:
-    1. AR (Autoregressive) 成分: 捕捉长期依赖
-    2. MA (Moving Average) 成分: 捕捉局部模式
-    3. Varying Gate: 自适应调节AR和MA的权重
-    """
+    """WAVE: Weighted Autoregressive Varying Gate Attention"""
     def __init__(self, num_channels, window_size=3):
         super(WAVEChannelAttention, self).__init__()
         self.num_channels = num_channels
         self.window_size = window_size
         
-        # 全局池化（用于AR成分）
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        
-        # 局部池化（用于MA成分）
         self.local_pool = nn.AvgPool1d(kernel_size=window_size, stride=1, padding=window_size//2)
         
-        # AR路径：捕捉全局长期依赖
         self.ar_pathway = nn.Sequential(
             nn.Linear(num_channels, max(num_channels // 4, 1)),
             nn.ReLU(inplace=True),
             nn.Linear(max(num_channels // 4, 1), num_channels)
         )
         
-        # MA路径：捕捉局部短期模式
         self.ma_pathway = nn.Sequential(
             nn.Conv1d(num_channels, max(num_channels // 4, 1), kernel_size=1),
             nn.ReLU(inplace=True),
             nn.Conv1d(max(num_channels // 4, 1), num_channels, kernel_size=1)
         )
         
-        # Varying Gate：自适应权重调节
         self.gate = nn.Sequential(
             nn.Linear(num_channels * 2, num_channels),
             nn.Sigmoid()
         )
         
         self.sigmoid = nn.Sigmoid()
-        
-        print(f">>> Using WAVE Attention with window_size={window_size} for {num_channels} channels")
 
     def forward(self, x):
-        # x: [bs x nvars x d_model x patch_num]
         b, c, d, p = x.size()
-        x_reshape = x.view(b, c, -1)  # [B, C, D*P]
+        x_reshape = x.view(b, c, -1)
         
-        # AR成分：全局池化 + 全连接
-        ar_feat = self.global_pool(x_reshape).squeeze(-1)  # [B, C]
-        ar_out = self.ar_pathway(ar_feat)  # [B, C]
+        ar_feat = self.global_pool(x_reshape).squeeze(-1)
+        ar_out = self.ar_pathway(ar_feat)
         
-        # MA成分：局部池化 + 卷积
-        ma_feat = self.local_pool(x_reshape)  # [B, C, D*P]
-        ma_feat_pooled = self.global_pool(ma_feat).squeeze(-1)  # [B, C]
-        ma_out = ma_feat_pooled  # 简化版
+        ma_feat = self.local_pool(x_reshape)
+        ma_feat_pooled = self.global_pool(ma_feat).squeeze(-1)
+        ma_out = ma_feat_pooled
         
-        # Varying Gate：融合AR和MA
-        gate_input = torch.cat([ar_out, ma_out], dim=1)  # [B, 2C]
-        gate_weight = self.gate(gate_input)  # [B, C]
+        gate_input = torch.cat([ar_out, ma_out], dim=1)
+        gate_weight = self.gate(gate_input)
         
-        # 加权融合
-        fused = gate_weight * ar_out + (1 - gate_weight) * ma_out  # [B, C]
-        
-        # Sigmoid激活
-        attention_weights = self.sigmoid(fused).view(b, c, 1, 1)  # [B, C, 1, 1]
+        fused = gate_weight * ar_out + (1 - gate_weight) * ma_out
+        attention_weights = self.sigmoid(fused).view(b, c, 1, 1)
         
         return x * attention_weights.expand_as(x)
 
 
-class ECAAttention(nn.Module):
-    """ECA-Net (备选)"""
-    def __init__(self, num_channels, gamma=2, b=1):
-        super(ECAAttention, self).__init__()
-        t = int(abs((math.log(num_channels, 2) + b) / gamma))
-        k = t if t % 2 else t + 1
+class InvertedDecoderLayer(nn.Module):
+    """
+    核心创新3: Inverted Decoder Layer
+    灵感来自iTransformer，在变量维度应用attention
+    
+    架构特点:
+    1. 每个变量作为一个token (inverted)
+    2. Causal Mask支持自回归预测
+    3. 轻量级设计，只需1-2层
+    """
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+        super(InvertedDecoderLayer, self).__init__()
         
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        # Multi-Head Self-Attention (在变量维度)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
         
-        print(f">>> ECA kernel size: {k} for {num_channels} channels")
+        # Feed-Forward Network
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # Layer Normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        b, c, d, p = x.size()
-        y = self.avg_pool(x.view(b, c, -1))
-        y = self.conv(y.transpose(-1, -2)).transpose(-1, -2)
-        y = self.sigmoid(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+    def forward(self, x, causal_mask=None):
+        """
+        x: [batch_size, num_vars, d_model]
+        """
+        # Self-Attention with optional causal mask
+        attn_out, _ = self.self_attn(
+            x, x, x,
+            attn_mask=causal_mask,
+            need_weights=False
+        )
+        x = self.norm1(x + self.dropout(attn_out))
+        
+        # Feed-Forward
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + ffn_out)
+        
+        return x
+
+
+class InvertedDecoder(nn.Module):
+    """
+    Inverted Decoder模块
+    将Encoder输出的特征在变量维度进行建模
+    """
+    def __init__(self, num_vars, d_model, n_heads=4, d_ff=None, num_layers=2, dropout=0.1):
+        super(InvertedDecoder, self).__init__()
+        self.num_vars = num_vars
+        self.d_model = d_model
+        d_ff = d_ff or d_model * 4
+        
+        # Variable Embedding (可学习的变量embedding)
+        self.var_embedding = nn.Parameter(torch.randn(1, num_vars, d_model))
+        
+        # Decoder Layers
+        self.layers = nn.ModuleList([
+            InvertedDecoderLayer(d_model, n_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Output Projection (可选)
+        self.output_proj = nn.Linear(d_model, d_model)
+        
+        print(f">>> Using Inverted Decoder: {num_layers} layers, {n_heads} heads")
+
+    def forward(self, x, use_causal_mask=False):
+        """
+        x: [batch_size, num_vars, patch_num, d_model]
+        输出: [batch_size, num_vars, patch_num, d_model]
+        """
+        B, V, P, D = x.shape
+        
+        # 变量维度的全局池化作为初始输入
+        x_pooled = x.mean(dim=2)  # [B, V, D]
+        
+        # 添加可学习的变量embedding
+        x_pooled = x_pooled + self.var_embedding
+        
+        # 生成causal mask (可选)
+        causal_mask = None
+        if use_causal_mask:
+            causal_mask = torch.triu(
+                torch.ones(V, V, device=x.device) * float('-inf'),
+                diagonal=1
+            )
+        
+        # 通过Decoder Layers
+        for layer in self.layers:
+            x_pooled = layer(x_pooled, causal_mask)
+        
+        # Output projection
+        x_pooled = self.output_proj(x_pooled)  # [B, V, D]
+        
+        # 广播回原始形状并与输入融合
+        x_pooled = x_pooled.unsqueeze(2).expand(-1, -1, P, -1)
+        
+        # 残差连接
+        output = x + x_pooled
+        
+        return output
 
 
 class FlattenHead(nn.Module):
@@ -170,12 +242,10 @@ class FlattenHead(nn.Module):
 
 class Model(nn.Module):
     """
-    Enhanced PatchTST with:
-    1. RevIN normalization (可开关)
-    2. WAVE Attention (2025最新，可开关)
-    
-    可通过configs.use_revin和configs.use_channel_attn控制
-    可通过configs.channel_attn_type选择: 'wave', 'eca'
+    Triple-Enhanced PatchTST:
+    1. RevIN normalization
+    2. WAVE channel attention (AR+MA)
+    3. Inverted Decoder (variable-wise modeling)
     """
 
     def __init__(self, configs, patch_len=16, stride=8):
@@ -185,19 +255,19 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         padding = stride
 
-        # RevIN
+        # 1. RevIN
         self.use_revin = getattr(configs, 'use_revin', True)
         if self.use_revin:
             self.revin = RevIN(configs.enc_in, affine=True)
-            print(f">>> Using RevIN normalization")
+            print(f">>> [1/3] Using RevIN normalization")
         else:
-            print(f">>> Using standard normalization")
+            print(f">>> [1/3] Using standard normalization")
 
         # Patch嵌入
         self.patch_embedding = PatchEmbedding(
             configs.d_model, patch_len, stride, padding, configs.dropout)
 
-        # Encoder
+        # Standard Encoder (时间维度建模)
         self.encoder = Encoder(
             [
                 EncoderLayer(
@@ -213,21 +283,31 @@ class Model(nn.Module):
             norm_layer=nn.Sequential(Transpose(1,2), nn.BatchNorm1d(configs.d_model), Transpose(1,2))
         )
 
-        # Channel Attention
+        # 2. WAVE Channel Attention
         self.use_channel_attn = getattr(configs, 'use_channel_attn', True)
         if self.use_channel_attn:
-            attn_type = getattr(configs, 'channel_attn_type', 'wave')
-            if attn_type == 'wave':
-                window_size = getattr(configs, 'wave_window_size', 3)
-                self.channel_attention = WAVEChannelAttention(configs.enc_in, window_size=window_size)
-                print(f">>> Using WAVE Channel Attention")
-            elif attn_type == 'eca':
-                self.channel_attention = ECAAttention(configs.enc_in)
-                print(f">>> Using ECA Channel Attention")
-            else:
-                raise ValueError(f"Unknown channel attention type: {attn_type}")
+            window_size = getattr(configs, 'wave_window_size', 3)
+            self.channel_attention = WAVEChannelAttention(configs.enc_in, window_size=window_size)
+            print(f">>> [2/3] Using WAVE Channel Attention")
         else:
-            print(f">>> Not using Channel Attention")
+            print(f">>> [2/3] Not using Channel Attention")
+
+        # 3. Inverted Decoder (核心创新)
+        self.use_inverted_decoder = getattr(configs, 'use_inverted_decoder', True)
+        if self.use_inverted_decoder:
+            inv_n_heads = getattr(configs, 'inv_n_heads', 4)
+            inv_layers = getattr(configs, 'inv_layers', 2)
+            self.inverted_decoder = InvertedDecoder(
+                num_vars=configs.enc_in,
+                d_model=configs.d_model,
+                n_heads=inv_n_heads,
+                d_ff=configs.d_ff,
+                num_layers=inv_layers,
+                dropout=configs.dropout
+            )
+            print(f">>> [3/3] Using Inverted Decoder")
+        else:
+            print(f">>> [3/3] Not using Inverted Decoder")
 
         # Prediction Head
         self.head_nf = configs.d_model * int((configs.seq_len - patch_len) / stride + 2)
@@ -245,6 +325,7 @@ class Model(nn.Module):
                 self.head_nf * configs.enc_in, configs.num_class)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        # [1] RevIN normalization
         if self.use_revin:
             x_enc = self.revin(x_enc, 'norm')
         else:
@@ -254,19 +335,33 @@ class Model(nn.Module):
                 torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
             x_enc /= stdev
 
+        # Patching and embedding
         x_enc = x_enc.permute(0, 2, 1)
         enc_out, n_vars = self.patch_embedding(x_enc)
+
+        # Encoder (时间维度建模)
         enc_out, attns = self.encoder(enc_out)
+        
+        # Reshape: [B*V, P, D] -> [B, V, P, D]
         enc_out = torch.reshape(
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        
+        # [3] Inverted Decoder (变量维度建模)
+        if self.use_inverted_decoder:
+            enc_out = self.inverted_decoder(enc_out)
+        
+        # [B, V, P, D] -> [B, V, D, P]
         enc_out = enc_out.permute(0, 1, 3, 2)
 
+        # [2] WAVE Channel Attention
         if self.use_channel_attn:
             enc_out = self.channel_attention(enc_out)
 
+        # Decoder
         dec_out = self.head(enc_out)
         dec_out = dec_out.permute(0, 2, 1)
 
+        # De-Normalization
         if self.use_revin:
             dec_out = self.revin(dec_out, 'denorm')
         else:
@@ -292,6 +387,10 @@ class Model(nn.Module):
         enc_out, attns = self.encoder(enc_out)
         enc_out = torch.reshape(
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        
+        if self.use_inverted_decoder:
+            enc_out = self.inverted_decoder(enc_out)
+            
         enc_out = enc_out.permute(0, 1, 3, 2)
 
         if self.use_channel_attn:
@@ -319,6 +418,10 @@ class Model(nn.Module):
         enc_out, attns = self.encoder(enc_out)
         enc_out = torch.reshape(
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        
+        if self.use_inverted_decoder:
+            enc_out = self.inverted_decoder(enc_out)
+            
         enc_out = enc_out.permute(0, 1, 3, 2)
 
         if self.use_channel_attn:
@@ -351,6 +454,10 @@ class Model(nn.Module):
         enc_out, attns = self.encoder(enc_out)
         enc_out = torch.reshape(
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
+        
+        if self.use_inverted_decoder:
+            enc_out = self.inverted_decoder(enc_out)
+            
         enc_out = enc_out.permute(0, 1, 3, 2)
 
         if self.use_channel_attn:
