@@ -141,9 +141,10 @@ if __name__ == '__main__':
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
     
     # NewTimesNet
-    parser.add_argument('--use_revin', type=int, default=1, help='whether to use RevIN normalization')
+    parser.add_argument('--use_revin', type=int, default=1, help='whether to use RevIN')
     parser.add_argument('--use_channel_attn', type=int, default=1, help='whether to use channel attention')
-    parser.add_argument('--channel_attn_type', type=str, default='eca', help='type of channel attention: eca or cbam')
+    parser.add_argument('--channel_attn_type', type=str, default='wave', help='type: wave, eca')
+    parser.add_argument('--wave_window_size', type=int, default=3, help='window size for WAVE MA component')
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:

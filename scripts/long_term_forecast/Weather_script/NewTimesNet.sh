@@ -26,7 +26,8 @@ python -u run.py \
   --train_epochs 3 \
   --use_revin 0 \
   --use_channel_attn 1 \
-  --channel_attn_type 'eca'
+  --channel_attn_type 'wave' \
+  --wave_window_size 3
 
 
 
@@ -54,7 +55,8 @@ python -u run.py \
   --train_epochs 3 \
   --use_revin 0 \
   --use_channel_attn 1 \
-  --channel_attn_type 'eca'
+  --channel_attn_type 'wave' \
+  --wave_window_size 3
 
 
 
@@ -83,7 +85,8 @@ python -u run.py \
   --train_epochs 3 \
   --use_revin 0 \
   --use_channel_attn 1 \
-  --channel_attn_type 'eca'
+  --channel_attn_type 'wave' \
+  --wave_window_size 3
 
 
 
@@ -112,4 +115,5 @@ python -u run.py \
   --train_epochs 3 \
   --use_revin 0 \
   --use_channel_attn 1 \
-  --channel_attn_type 'eca'
+  --channel_attn_type 'wave' \
+  --wave_window_size 3
