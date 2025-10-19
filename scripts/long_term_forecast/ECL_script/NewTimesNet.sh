@@ -14,7 +14,7 @@ python -u run.py \
   --seq_len 96 \
   --label_len 48 \
   --pred_len 96 \
-  --e_layers 2 \
+  --e_layers 3 \
   --d_layers 1 \
   --factor 3 \
   --enc_in 321 \
@@ -25,8 +25,8 @@ python -u run.py \
   --itr 1 \
   --train_epochs 100 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 8 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -41,7 +41,7 @@ python -u run.py \
   --seq_len 96 \
   --label_len 48 \
   --pred_len 192 \
-  --e_layers 2 \
+  --e_layers 3 \
   --d_layers 1 \
   --factor 3 \
   --enc_in 321 \
@@ -52,8 +52,8 @@ python -u run.py \
   --itr 1 \
   --train_epochs 100 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 8 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -68,7 +68,7 @@ python -u run.py \
   --seq_len 96 \
   --label_len 48 \
   --pred_len 336 \
-  --e_layers 2 \
+  --e_layers 3 \
   --d_layers 1 \
   --factor 3 \
   --enc_in 321 \
@@ -79,8 +79,8 @@ python -u run.py \
   --itr 1 \
   --train_epochs 100 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 8 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -95,7 +95,7 @@ python -u run.py \
   --seq_len 96 \
   --label_len 48 \
   --pred_len 720 \
-  --e_layers 2 \
+  --e_layers 3 \
   --d_layers 1 \
   --factor 3 \
   --enc_in 321 \
@@ -106,6 +106,6 @@ python -u run.py \
   --itr 1 \
   --train_epochs 100 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 8 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
