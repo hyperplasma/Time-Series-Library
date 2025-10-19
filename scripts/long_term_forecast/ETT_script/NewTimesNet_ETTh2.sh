@@ -26,7 +26,10 @@ python -u run.py \
   --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
-  --inv_layers 2
+  --inv_layers 2 \
+  --inv_n_heads 2 \
+  --inv_layers 1 \
+  --inv_residual_weight 0.3
 
 
 
@@ -54,7 +57,10 @@ python -u run.py \
   --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
-  --inv_layers 2
+  --inv_layers 2 \
+  --inv_n_heads 2 \
+  --inv_layers 1 \
+  --inv_residual_weight 0.3
 
 
 
@@ -82,7 +88,10 @@ python -u run.py \
   --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
-  --inv_layers 2
+  --inv_layers 2 \
+  --inv_n_heads 2 \
+  --inv_layers 1 \
+  --inv_residual_weight 0.3
 
 
 
@@ -110,4 +119,7 @@ python -u run.py \
   --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
-  --inv_layers 2
+  --inv_layers 2 \
+  --inv_n_heads 2 \
+  --inv_layers 1 \
+  --inv_residual_weight 0.3
