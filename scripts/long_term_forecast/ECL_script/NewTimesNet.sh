@@ -21,7 +21,7 @@ python -u run.py \
   --dec_in 321 \
   --c_out 321 \
   --des 'Exp' \
-  --batch_size 32 \
+  --batch_size 16 \
   --itr 1 \
   --train_epochs 50 \
   --use_inverted_decoder 1 \
@@ -48,7 +48,7 @@ python -u run.py \
   --dec_in 321 \
   --c_out 321 \
   --des 'Exp' \
-  --batch_size 32 \
+  --batch_size 16 \
   --itr 1 \
   --train_epochs 50 \
   --use_inverted_decoder 1 \
@@ -75,7 +75,7 @@ python -u run.py \
   --dec_in 321 \
   --c_out 321 \
   --des 'Exp' \
-  --batch_size 32 \
+  --batch_size 16 \
   --itr 1 \
   --train_epochs 50 \
   --use_inverted_decoder 1 \
@@ -102,7 +102,7 @@ python -u run.py \
   --dec_in 321 \
   --c_out 321 \
   --des 'Exp' \
-  --batch_size 32 \
+  --batch_size 16 \
   --itr 1 \
   --train_epochs 50 \
   --use_inverted_decoder 1 \
