@@ -30,7 +30,7 @@ python -u run.py \
   --inv_layers 2 \
   --inv_n_heads 2 \
   --inv_layers 1 \
-  --inv_residual_weight 0.3
+  --inv_residual_weight 1.0
 
 
 
@@ -62,7 +62,7 @@ python -u run.py \
   --inv_layers 2 \
   --inv_n_heads 2 \
   --inv_layers 1 \
-  --inv_residual_weight 0.3
+  --inv_residual_weight 1.0
 
 
 
@@ -94,7 +94,7 @@ python -u run.py \
   --inv_layers 2 \
   --inv_n_heads 2 \
   --inv_layers 1 \
-  --inv_residual_weight 0.3
+  --inv_residual_weight 1.0
 
 
 
@@ -126,4 +126,4 @@ python -u run.py \
   --inv_layers 2 \
   --inv_n_heads 2 \
   --inv_layers 1 \
-  --inv_residual_weight 0.3
+  --inv_residual_weight 1.0
