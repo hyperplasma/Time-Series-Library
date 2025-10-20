@@ -29,8 +29,8 @@ python -u run.py \
   --train_epochs 30 \
   --use_amp \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
-  --inv_layers 6 \
+  --inv_n_heads 64 \
+  --inv_layers 8 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -60,8 +60,8 @@ python -u run.py \
   --train_epochs 30 \
   --use_amp \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
-  --inv_layers 6 \
+  --inv_n_heads 64 \
+  --inv_layers 8 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -91,8 +91,8 @@ python -u run.py \
   --train_epochs 30 \
   --use_amp \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
-  --inv_layers 6 \
+  --inv_n_heads 64 \
+  --inv_layers 8 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -122,6 +122,6 @@ python -u run.py \
   --use_amp \
   --itr 1 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
-  --inv_layers 6 \
+  --inv_n_heads 64 \
+  --inv_layers 8 \
   --inv_residual_weight 1.0
