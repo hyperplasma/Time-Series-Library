@@ -26,7 +26,10 @@ python -u run.py \
   --des 'Exp' \
   --batch_size 4 \
   --itr 1 \
-  --use_inverted_decoder 1
+  --use_inverted_decoder 1 \
+  --inv_n_heads 12 \
+  --inv_layers 3 \
+  --inv_residual_weight 1.0
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -52,7 +55,10 @@ python -u run.py \
   --des 'Exp' \
   --batch_size 4 \
   --itr 1 \
-  --use_inverted_decoder 1
+  --use_inverted_decoder 1 \
+  --inv_n_heads 12 \
+  --inv_layers 3 \
+  --inv_residual_weight 1.0
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -78,7 +84,10 @@ python -u run.py \
   --des 'Exp' \
   --batch_size 4 \
   --itr 1 \
-  --use_inverted_decoder 1
+  --use_inverted_decoder 1 \
+  --inv_n_heads 12 \
+  --inv_layers 3 \
+  --inv_residual_weight 1.0
 
 python -u run.py \
   --task_name long_term_forecast \
@@ -104,4 +113,7 @@ python -u run.py \
   --des 'Exp' \
   --batch_size 4 \
   --itr 1 \
-  --use_inverted_decoder 1
+  --use_inverted_decoder 1 \
+  --inv_n_heads 12 \
+  --inv_layers 3 \
+  --inv_residual_weight 1.0
