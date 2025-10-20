@@ -24,7 +24,7 @@ python -u run.py \
   --d_ff 512 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 4 \
+  --batch_size 8 \
   --itr 1 \
   --train_epochs 50 \
   --use_inverted_decoder 1 \
@@ -54,7 +54,7 @@ python -u run.py \
   --d_ff 512 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 4 \
+  --batch_size 8 \
   --itr 1 \
   --train_epochs 50 \
   --use_inverted_decoder 1 \
@@ -84,7 +84,7 @@ python -u run.py \
   --d_ff 512 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 4 \
+  --batch_size 8 \
   --itr 1 \
   --train_epochs 50 \
   --use_inverted_decoder 1 \
@@ -114,7 +114,7 @@ python -u run.py \
   --d_ff 512 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 4 \
+  --batch_size 8 \
   --train_epochs 50 \
   --itr 1 \
   --use_inverted_decoder 1 \
