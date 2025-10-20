@@ -26,7 +26,8 @@ python -u run.py \
   --des 'Exp' \
   --batch_size 8 \
   --itr 1 \
-  --train_epochs 50 \
+  --train_epochs 30 \
+  --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 32 \
   --inv_layers 6 \
@@ -56,7 +57,8 @@ python -u run.py \
   --des 'Exp' \
   --batch_size 8 \
   --itr 1 \
-  --train_epochs 50 \
+  --train_epochs 30 \
+  --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 32 \
   --inv_layers 6 \
@@ -86,7 +88,8 @@ python -u run.py \
   --des 'Exp' \
   --batch_size 8 \
   --itr 1 \
-  --train_epochs 50 \
+  --train_epochs 30 \
+  --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 32 \
   --inv_layers 6 \
@@ -115,7 +118,8 @@ python -u run.py \
   --top_k 5 \
   --des 'Exp' \
   --batch_size 8 \
-  --train_epochs 50 \
+  --train_epochs 30 \
+  --use_amp \
   --itr 1 \
   --use_inverted_decoder 1 \
   --inv_n_heads 32 \
