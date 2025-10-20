@@ -27,8 +27,8 @@ python -u run.py \
   --batch_size 4 \
   --itr 1 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 12 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -56,8 +56,8 @@ python -u run.py \
   --batch_size 4 \
   --itr 1 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 12 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -85,8 +85,8 @@ python -u run.py \
   --batch_size 4 \
   --itr 1 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 12 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -114,6 +114,6 @@ python -u run.py \
   --batch_size 4 \
   --itr 1 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 12 \
-  --inv_layers 3 \
+  --inv_n_heads 16 \
+  --inv_layers 4 \
   --inv_residual_weight 1.0
