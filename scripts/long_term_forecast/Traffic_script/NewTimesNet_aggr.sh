@@ -20,18 +20,17 @@ python -u run.py \
   --enc_in 862 \
   --dec_in 862 \
   --c_out 862 \
-  --d_model 768 \
-  --d_ff 2048 \
+  --d_model 672 \
+  --d_ff 1536 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 16 \
-  --learning_rate 0.00005 \
+  --batch_size 8 \
   --itr 1 \
   --train_epochs 30 \
   --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 48 \
-  --inv_layers 8 \
+  --inv_layers 6 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -52,18 +51,17 @@ python -u run.py \
   --enc_in 862 \
   --dec_in 862 \
   --c_out 862 \
-  --d_model 768 \
-  --d_ff 2048 \
+  --d_model 672 \
+  --d_ff 1536 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 16 \
-  --learning_rate 0.00005 \
+  --batch_size 8 \
   --itr 1 \
   --train_epochs 30 \
   --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 48 \
-  --inv_layers 8 \
+  --inv_layers 6 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -84,18 +82,17 @@ python -u run.py \
   --enc_in 862 \
   --dec_in 862 \
   --c_out 862 \
-  --d_model 768 \
-  --d_ff 2048 \
+  --d_model 672 \
+  --d_ff 1536 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 16 \
-  --learning_rate 0.00005 \
+  --batch_size 8 \
   --itr 1 \
   --train_epochs 30 \
   --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 48 \
-  --inv_layers 8 \
+  --inv_layers 6 \
   --inv_residual_weight 1.0
 
 python -u run.py \
@@ -116,16 +113,14 @@ python -u run.py \
   --enc_in 862 \
   --dec_in 862 \
   --c_out 862 \
-  --d_model 768 \
-  --d_ff 2048 \
+  --d_model 672 \
+  --d_ff 1536 \
   --top_k 5 \
   --des 'Exp' \
-  --batch_size 16 \
-  --learning_rate 0.00005 \
-  --train_epochs 30 \
+  --batch_size 8 \
   --use_amp \
   --itr 1 \
   --use_inverted_decoder 1 \
   --inv_n_heads 48 \
-  --inv_layers 8 \
+  --inv_layers 6 \
   --inv_residual_weight 1.0
