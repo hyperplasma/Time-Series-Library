@@ -23,7 +23,6 @@ python -u run.py \
   --des 'Exp' \
   --n_heads 4 \
   --itr 1 \
-  --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
@@ -52,7 +51,6 @@ python -u run.py \
   --des 'Exp' \
   --n_heads 4 \
   --itr 1 \
-  --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
@@ -81,7 +79,6 @@ python -u run.py \
   --des 'Exp' \
   --n_heads 4 \
   --itr 1 \
-  --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
@@ -110,7 +107,6 @@ python -u run.py \
   --des 'Exp' \
   --n_heads 4 \
   --itr 1 \
-  --use_amp \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
