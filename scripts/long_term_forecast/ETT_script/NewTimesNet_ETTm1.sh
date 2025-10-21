@@ -24,12 +24,9 @@ python -u run.py \
   --n_heads 2 \
   --batch_size 32 \
   --itr 1 \
-  --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
-  --inv_n_heads 2 \
-  --inv_layers 1 \
   --inv_residual_weight 1.0
 
 
@@ -56,12 +53,9 @@ python -u run.py \
   --n_heads 2 \
   --batch_size 128 \
   --itr 1 \
-  --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
-  --inv_n_heads 2 \
-  --inv_layers 1 \
   --inv_residual_weight 1.0
 
 
@@ -88,12 +82,9 @@ python -u run.py \
   --n_heads 4 \
   --batch_size 128 \
   --itr 1 \
-  --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
-  --inv_n_heads 2 \
-  --inv_layers 1 \
   --inv_residual_weight 1.0
 
 
@@ -120,10 +111,7 @@ python -u run.py \
   --n_heads 4 \
   --batch_size 128 \
   --itr 1 \
-  --use_revin 0 \
   --use_inverted_decoder 1 \
   --inv_n_heads 4 \
   --inv_layers 2 \
-  --inv_n_heads 2 \
-  --inv_layers 1 \
   --inv_residual_weight 1.0
