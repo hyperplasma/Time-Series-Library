@@ -23,7 +23,7 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 4 \
-  --use_multi_gpu 1 \
+  --use_multi_gpu \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
   --inv_n_heads 8 \
@@ -52,7 +52,7 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 16 \
-  --use_multi_gpu 1 \
+  --use_multi_gpu \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
   --inv_n_heads 8 \
@@ -82,7 +82,7 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --use_multi_gpu 1 \
+  --use_multi_gpu \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
   --inv_n_heads 8 \
@@ -112,7 +112,7 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --use_multi_gpu 1 \
+  --use_multi_gpu \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
   --inv_n_heads 8 \
