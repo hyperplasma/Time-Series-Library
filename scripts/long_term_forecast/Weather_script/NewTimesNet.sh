@@ -26,7 +26,7 @@ python -u run.py \
   --use_multi_gpu 1 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 16 \
+  --inv_n_heads 8 \
   --inv_layers 2
 
 
@@ -55,7 +55,7 @@ python -u run.py \
   --use_multi_gpu 1 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 16 \
+  --inv_n_heads 8 \
   --inv_layers 2
 
 
@@ -85,7 +85,7 @@ python -u run.py \
   --use_multi_gpu 1 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 16 \
+  --inv_n_heads 8 \
   --inv_layers 2
 
 
@@ -115,5 +115,5 @@ python -u run.py \
   --use_multi_gpu 1 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 16 \
+  --inv_n_heads 8 \
   --inv_layers 2
