@@ -25,7 +25,7 @@ python -u run.py \
   --n_heads 4 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
+  --inv_n_heads 16 \
   --inv_layers 2
 
 
@@ -53,7 +53,7 @@ python -u run.py \
   --n_heads 16 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
+  --inv_n_heads 16 \
   --inv_layers 2
 
 
@@ -82,7 +82,7 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
+  --inv_n_heads 16 \
   --inv_layers 2
 
 
@@ -111,5 +111,5 @@ python -u run.py \
   --batch_size 128 \
   --train_epochs 30 \
   --use_inverted_decoder 1 \
-  --inv_n_heads 32 \
+  --inv_n_heads 16 \
   --inv_layers 2
