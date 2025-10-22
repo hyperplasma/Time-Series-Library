@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 model_name=NewTimesNet
 
@@ -23,7 +23,10 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 4 \
-  --use_inverted_decoder 1
+  --train_epochs 30 \
+  --use_inverted_decoder 1 \
+  --inv_n_heads 32 \
+  --inv_layers 4
 
 
 
@@ -48,7 +51,10 @@ python -u run.py \
   --des 'Exp' \
   --itr 1 \
   --n_heads 16 \
-  --use_inverted_decoder 1
+  --train_epochs 30 \
+  --use_inverted_decoder 1 \
+  --inv_n_heads 32 \
+  --inv_layers 4
 
 
 
@@ -74,7 +80,10 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --use_inverted_decoder 1
+  --train_epochs 30 \
+  --use_inverted_decoder 1 \
+  --inv_n_heads 32 \
+  --inv_layers 4
 
 
 
@@ -100,4 +109,7 @@ python -u run.py \
   --itr 1 \
   --n_heads 4 \
   --batch_size 128 \
-  --use_inverted_decoder 1
+  --train_epochs 30 \
+  --use_inverted_decoder 1 \
+  --inv_n_heads 32 \
+  --inv_layers 4
