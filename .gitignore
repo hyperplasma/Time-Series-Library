@@ -172,3 +172,5 @@ environment.txt
 .idea
 
 test/
+
+.empty
