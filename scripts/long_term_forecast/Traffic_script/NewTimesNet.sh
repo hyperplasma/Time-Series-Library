@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 model_name=NewTimesNet
 
@@ -28,6 +28,7 @@ python -u run.py \
   --itr 1 \
   --train_epochs 30 \
   --use_amp \
+  --use_multi_gpu \
   --use_inverted_decoder 1 \
   --inv_n_heads 128 \
   --inv_layers 8 \
@@ -59,6 +60,7 @@ python -u run.py \
   --itr 1 \
   --train_epochs 30 \
   --use_amp \
+  --use_multi_gpu \
   --use_inverted_decoder 1 \
   --inv_n_heads 128 \
   --inv_layers 8 \
@@ -90,6 +92,7 @@ python -u run.py \
   --itr 1 \
   --train_epochs 30 \
   --use_amp \
+  --use_multi_gpu \
   --use_inverted_decoder 1 \
   --inv_n_heads 128 \
   --inv_layers 8 \
@@ -120,6 +123,7 @@ python -u run.py \
   --batch_size 8 \
   --train_epochs 30 \
   --use_amp \
+  --use_multi_gpu \
   --itr 1 \
   --use_inverted_decoder 1 \
   --inv_n_heads 128 \
